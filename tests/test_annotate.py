@@ -31,12 +31,14 @@ class BrightDetector:
     def __init__(self, blind=()):
         self.blind = set(blind)
         self.calls = 0
+        self.shapes = set()
 
     def __call__(self, frames):
         results = []
         for frame in frames:
             index = self.calls
             self.calls += 1
+            self.shapes.add(frame.shape)
             mask = (frame.min(axis=2) > 240) & (index not in self.blind)
             results.append(FrameDetections(np.zeros((0, 4)), np.zeros(0), np.zeros(0, int), mask))
         return results
@@ -95,6 +97,19 @@ def test_annotate_video_writes_regions_cuts_and_a_preview(tmp_path):
     # window, the 100 after it are too short for one.
     rows = build_video_pairs(video, out, tmp_path / "data", PairConfig(camera=CameraConfig(canvas=64)), seed=0)
     assert len(rows) == 1 and rows[0]["start"] + 121 <= 200
+
+
+def test_detection_runs_at_the_model_size_and_maps_back_to_video_pixels(tmp_path):
+    video = tmp_path / "clip.mp4"
+    write_video(video, square_frames(40), 30.0, crf=16)  # 320x240
+    detector = BrightDetector()
+    detector.size = 160  # a model with a 160 px input
+    annotate_video(video, detector, tmp_path / "clip.json", AnnotateConfig(min_track_seconds=0.5),
+                   preview_path=tmp_path / "p.jpg")
+    assert detector.shapes == {(120, 160, 3)}
+    x0, y0, x1, y1 = load_regions(tmp_path / "clip.json").frames[20][0].box
+    assert abs(x0 - 70) <= 3 and abs(x1 - 129) <= 3 and abs(y0 - 80) <= 3 and abs(y1 - 139) <= 3  # the square, grown
+    assert (tmp_path / "p.jpg").stat().st_size > 1000
 
 
 def test_strided_detection_still_covers_every_frame(tmp_path):

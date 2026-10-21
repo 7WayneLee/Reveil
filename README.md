@@ -38,6 +38,7 @@ python -m reveil.annotate --videos sources/ --model detector.onnx --out regions/
 ```
 
 - 模型要先用 ultralytics 匯出成 ONNX：`yolo export model=<權重>.pt format=onnx dynamic=True`。Reveil 只讀 ONNX 檔，不 import ultralytics。
+- 影片直接解碼成模型輸入的大小（例如 640），在這個大小上找區域，再換算回原始像素；4K 影片不會比 1080p 慢太多。
 - 分割模型的遮罩變成輪廓多邊形，偵測模型的框變成方框，都會再外擴一點（`--grow`，畫面短邊的比例）。
 - 每格的偵測結果會連成 track：短於 `--min-track-seconds` 的丟掉，`--max-gap-seconds` 以內的漏偵測用前後影格補上。偵測到的場景切換寫進 `cuts`。
 - `--classes` 只保留指定類別（名稱或編號），`--conf` 是分數門檻，`--stride N` 每 N 格偵測一次（中間的影格會補上）。執行時會印出模型的所有類別。
@@ -85,7 +86,8 @@ mosaic: {block_fraction: [0.008, 0.015], blur_probability: 0.0}
 
 - A100 80GB 執行階段
 - Colab 密鑰 `HF_TOKEN`（先在 Hugging Face 同意 LTX-2.5 的條款）
-- Drive 上的 `reveil/sources/`（原始影片）；`reveil/regions/`（標註）會自動產生，也可以自己放
+- 訓練用的無碼影片：預設讀 Drive 上的 `reveil/sources/FC2/`，可以是指到別人分享資料夾的 Drive 捷徑，子資料夾也會讀。設定裡的 `SOURCES` 可以改成別的資料夾，或列好幾個。有碼片（例如 `reveil/sources/` 裡的 AV）留給之後去碼用，不要列進 `SOURCES`。
+- `reveil/regions/`（標註）會自動產生，也可以自己放
 
 notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。偵測模型第一次匯出成 ONNX 後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。每部影片最多取 `MAX_WINDOWS_PER_VIDEO` 組配對（預設 100，隨機挑），讓資料平均來自不同影片；正式訓練的配對少於 `MIN_SAMPLES`（預設 100）時，notebook 會停下來不訓練。
 

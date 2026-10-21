@@ -94,6 +94,14 @@ class CutDetector:
         return cut
 
 
+def _work_size(width: int, height: int, side: int | None) -> tuple[int, int]:
+    """The frame size detection runs at: the video scaled down to fit a ``side`` square."""
+    if not side or max(width, height) <= side:
+        return width, height
+    scale = side / max(width, height)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
 def _move(region: Region, source: Box, target: Box) -> Region:
     """``region`` carried from ``source`` box to ``target`` box (shifted and scaled)."""
     sx = (target[2] - target[0]) / max(source[2] - source[0], 1e-6)
@@ -167,32 +175,43 @@ def annotate_video(
     preview_path: str | Path | None = None,
 ) -> dict:
     """Write the region file of ``video``; ``detector(frames)`` returns ``FrameDetections``
-    per frame. Returns a summary of what was found."""
+    per frame. Returns a summary of what was found.
+
+    When the detector has a ``size`` (its square input side), frames are decoded straight
+    to that size, which is all the detail the model sees anyway, and the regions are mapped
+    back to video pixels."""
     info = probe(video)
+    work_w, work_h = _work_size(info.width, info.height, getattr(detector, "size", None))
+    work_box = (-0.5, -0.5, work_w - 0.5, work_h - 0.5)  # pixel centres line up
+    video_box = (-0.5, -0.5, info.width - 0.5, info.height - 0.5)
     detected: dict[int, list[Region]] = {}
     cuts: set[int] = set()
     is_cut = CutDetector(config.cut_threshold)
     batch: list[np.ndarray] = []
     batch_frames: list[int] = []
     scale = min(1.0, PREVIEW_WIDTH / info.width)
+    preview_size = (max(1, round(info.width * scale)), max(1, round(info.height * scale)))
     sample_every = max(1, info.frames // max(1, config.preview_frames * 4))
     samples: dict[int, np.ndarray] = {}
 
     def flush() -> None:
         for index, found in zip(batch_frames, detector(batch)):
-            regions = detection_regions(found, info.width, info.height, config)
+            regions = detection_regions(found, work_w, work_h, config)
+            if regions and work_box != video_box:
+                regions = [_move(region, work_box, video_box) for region in regions]
             if regions:
                 detected[index] = regions
         batch.clear()
         batch_frames.clear()
 
     frame_count = 0
-    for index, frame in enumerate(read_frames(video)):
+    size = None if work_box == video_box else (work_w, work_h)
+    for index, frame in enumerate(read_frames(video, size)):
         frame_count = index + 1
         if is_cut(frame) and index:
             cuts.add(index)
         if preview_path is not None and index % sample_every == 0:
-            samples[index] = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            samples[index] = cv2.resize(frame, preview_size, interpolation=cv2.INTER_AREA)
         if index % config.stride == 0:
             batch.append(frame)
             batch_frames.append(index)
@@ -208,6 +227,7 @@ def annotate_video(
     if preview_path is not None:
         write_preview(samples, regions, scale, Path(preview_path), config.preview_frames)
     return {
+        "size": f"{info.width}x{info.height}",
         "frames": frame_count,
         "detected_frames": len(detected),
         "region_frames": len(regions.frames),

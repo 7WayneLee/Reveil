@@ -53,7 +53,9 @@ def letterbox(frame: np.ndarray, size: int) -> tuple[np.ndarray, Letterbox]:
     width, height = max(1, round(w * scale)), max(1, round(h * scale))
     left, top = (size - width) // 2, (size - height) // 2
     canvas = np.full((size, size, 3), PAD_VALUE, dtype=np.uint8)
-    canvas[top : top + height, left : left + width] = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+    if (w, h) != (width, height):
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+    canvas[top : top + height, left : left + width] = frame
     return canvas, Letterbox(scale, left, top, width, height)
 
 
@@ -108,7 +110,9 @@ def instance_union(coefficients: np.ndarray, protos: np.ndarray, boxes: np.ndarr
 
 def to_frame_mask(union: np.ndarray, box: Letterbox, frame_w: int, frame_h: int) -> np.ndarray:
     content = union[box.top : box.top + box.height, box.left : box.left + box.width]
-    return cv2.resize(content, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR) > MASK_THRESHOLD
+    if content.shape != (frame_h, frame_w):
+        content = cv2.resize(content, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR)
+    return content > MASK_THRESHOLD
 
 
 def to_frame_boxes(boxes: np.ndarray, box: Letterbox, frame_w: int, frame_h: int) -> np.ndarray:
@@ -195,21 +199,22 @@ class YoloOnnx:
 
     def _run(self, frames: list[np.ndarray]) -> list[FrameDetections]:
         canvases, boxes_in = zip(*(letterbox(frame, self.size) for frame in frames))
-        batch = np.stack(canvases).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
-        if self._fixed_batch and len(frames) < self._fixed_batch:
-            pad = np.zeros((self._fixed_batch - len(frames), *batch.shape[1:]), dtype=batch.dtype)
-            batch = np.concatenate([batch, pad])
-        outputs = self.session.run(None, {self._input_name: batch.astype(self._input_dtype)})
+        # NHWC uint8 -> NCHW scaled to 0..1 in one pass; padded up to a fixed batch size
+        count = len(frames)
+        batch = np.empty((self._fixed_batch or count, 3, self.size, self.size), dtype=self._input_dtype)
+        np.multiply(np.stack(canvases).transpose(0, 3, 1, 2), np.float32(1 / 255), out=batch[:count])
+        batch[count:] = 0
+        outputs = self.session.run(None, {self._input_name: batch})
         results = []
         for i, (frame, box) in enumerate(zip(frames, boxes_in)):
             h, w = frame.shape[:2]
             found, scores, classes, coefficients = decode(
-                outputs[0][i].astype(np.float32), len(self.names), self._keep,
+                outputs[0][i].astype(np.float32, copy=False), len(self.names), self._keep,
                 self.config.conf, self.config.iou, self.config.max_detections,
             )
             mask = None
             if self.task == "segment":
-                union = instance_union(coefficients, outputs[1][i].astype(np.float32), found, self.size)
+                union = instance_union(coefficients, outputs[1][i].astype(np.float32, copy=False), found, self.size)
                 mask = to_frame_mask(union, box, w, h)
             results.append(FrameDetections(to_frame_boxes(found, box, w, h), scores, classes, mask))
         return results
