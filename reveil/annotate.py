@@ -372,7 +372,7 @@ def _annotate_in_worker(video: Path, out_path: Path, config: AnnotateConfig, pre
 
 
 def main(argv: list[str] | None = None) -> int:
-    from reveil.make_pairs import find_videos
+    from reveil.make_pairs import find_videos, largest_first
 
     parser = argparse.ArgumentParser(prog="reveil-annotate", description=__doc__.split("\n\n")[0])
     parser.add_argument("--videos", nargs="+", type=Path, required=True, help="video files or directories")
@@ -445,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     if changed and done:
         print(f"the settings differ from those of the {len(done)} existing region files: annotating them again",
               flush=True)
-    jobs = [v for v in videos if args.overwrite or changed or v not in done]
+    jobs = largest_first([v for v in videos if args.overwrite or changed or v not in done])
     print(f"{len(videos)} videos, {len(videos) - len(jobs)} already annotated", flush=True)
     args.out.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=1))

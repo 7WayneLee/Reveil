@@ -68,6 +68,12 @@ def find_videos(paths: list[Path]) -> list[Path]:
     return videos
 
 
+def largest_first(videos: list[Path]) -> list[Path]:
+    """``videos``, the biggest file first: a long video started last would keep one worker
+    busy long after the others are done."""
+    return sorted(videos, key=lambda video: video.stat().st_size, reverse=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="reveil-make-pairs", description=__doc__.split("\n\n")[0])
     parser.add_argument("--videos", nargs="+", type=Path, required=True, help="video files or directories")
@@ -95,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(f"reveil-make-pairs: no videos ({', '.join(sorted(VIDEO_SUFFIXES))}) in {', '.join(map(str, args.videos))}")
     jobs: list[tuple[Path, Path | None]] = []
     stems: dict[str, Path] = {}
-    for video in videos:
+    for video in largest_first(videos):
         stem = safe_stem(video)
         if stem in stems:
             sys.exit(f"reveil-make-pairs: {video} and {stems[stem]} share the name {stem!r}; rename one")

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from reveil.camera import CameraConfig
-from reveil.make_pairs import find_videos, load_config, main
+from reveil.make_pairs import find_videos, largest_first, load_config, main
 from reveil.mosaic import MosaicConfig
 from reveil.pairs import PairConfig, build_video_pairs, rebuild_dataset
 from reveil.regions import Region, RegionSet
@@ -123,3 +123,10 @@ def test_config_rejects_unknown_fields(tmp_path):
     else:
         raise AssertionError("unknown field accepted")
     assert replace(PairConfig(), hop=104).hop == 104
+
+
+def test_the_biggest_videos_go_first(tmp_path):
+    sizes = {"a.mp4": 10, "b.mp4": 30, "c.mp4": 20}
+    for name, size in sizes.items():
+        (tmp_path / name).write_bytes(bytes(size))
+    assert [p.name for p in largest_first(sorted(tmp_path.iterdir()))] == ["b.mp4", "c.mp4", "a.mp4"]
