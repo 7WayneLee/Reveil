@@ -84,7 +84,7 @@ mosaic: {block_fraction: [0.008, 0.015], blur_probability: 0.0}
 
 在 Colab 選「檔案 → 開啟筆記本 → GitHub」，輸入 `7WayneLee/Reveil`，開啟 `notebooks/train_colab.ipynb`。需要：
 
-- A100 80GB 執行階段
+- A100 執行階段。80GB 最好；40GB 也可以：標註、配對、前處理都一樣，訓練時底模自動改用 INT8 量化（`int8-quanto`，約 22 GB），每步比較慢。checkpoint 在兩種卡之間可以互相接著訓練。
 - Colab 密鑰 `HF_TOKEN`（先在 Hugging Face 同意 LTX-2.5 的條款）
 - 訓練用的無碼影片：預設讀 Drive 上的 `reveil/sources/FC2/`，可以是指到別人分享資料夾的 Drive 捷徑，子資料夾也會讀。設定裡的 `SOURCES` 可以改成別的資料夾，或列好幾個。有碼片（例如 `reveil/sources/` 裡的 AV）留給之後去碼用，不要列進 `SOURCES`。
 - `reveil/regions/`（標註）會自動產生，也可以自己放
