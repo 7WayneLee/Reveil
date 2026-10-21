@@ -148,7 +148,9 @@ class YoloOnnx:
                 pass
         if providers is None:
             available = ort.get_available_providers()
-            providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
+            providers = ["CPUExecutionProvider"]
+            if "CUDAExecutionProvider" in available:  # GPU memory grows only as needed: several workers share it
+                providers.insert(0, ("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}))
         self.session = ort.InferenceSession(str(path), providers=providers)
         self.config = config
         metadata = self.session.get_modelmeta().custom_metadata_map

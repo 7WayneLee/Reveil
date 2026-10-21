@@ -34,7 +34,7 @@ from reveil.video import probe, read_frames
 
 PREVIEW_WIDTH = 480
 SETTINGS_FILE = "annotate_settings.json"
-SETTINGS_VERSION = 2  # raised when the annotation itself changes, so old region files are redone
+SETTINGS_VERSION = 3  # raised when old region files must be redone (the annotation changed, or stray runs wrote some)
 
 
 @dataclass(frozen=True)
@@ -274,6 +274,11 @@ _detector = None
 
 def _start_worker(model: str, detector_config: DetectorConfig) -> None:
     global _detector
+    if sys.platform == "linux":  # end with the main process instead of keeping the GPU memory
+        import ctypes
+        import signal
+
+        ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
     _detector = YoloOnnx(model, detector_config)
 
 
