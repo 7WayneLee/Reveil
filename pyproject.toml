@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reveil"
+version = "0.1.0"
+description = "Mosaic restoration with an LTX-2.5 IC-LoRA: training data tools"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "av>=12",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+reveil-make-pairs = "reveil.make_pairs:main"
+reveil-conditions = "reveil.conditions:main"
+
+[tool.setuptools.packages.find]
+include = ["reveil*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

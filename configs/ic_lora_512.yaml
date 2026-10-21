@@ -1,0 +1,75 @@
+# ltx-trainer config: mosaic-restoration IC-LoRA on LTX-2.5 (dev), 512 x 512 x 121 pairs.
+# The Colab notebook fills in every path below and the step count; the rest is the recipe.
+model:
+  model_path: /content/models/ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors
+  text_encoder_path: /content/models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors
+  video_vae_path: /content/models/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors
+  audio_vae_path: /content/models/ltx-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors
+  training_mode: lora
+  load_checkpoint: null # a run's checkpoints/ directory resumes from its latest step
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: # video stream only: self-attention, prompt cross-attention, feed-forward
+    - attn1.to_k
+    - attn1.to_q
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_k
+    - attn2.to_q
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training_strategy:
+  name: flexible
+  video:
+    is_generated: true # the clean crop: noised, denoised, in the loss
+    latents_dir: latents
+    conditions:
+      # The mosaic crop: clean tokens at timestep 0 beside the target, same positions, no loss.
+      # No first_frame condition: when restoring, no frame of the window is known.
+      - type: reference
+        latents_dir: reference_latents
+        probability: 1.0
+
+optimization:
+  learning_rate: 2.0e-4
+  steps: 3000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: adamw
+  scheduler_type: linear
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: bf16
+  quantization: null # A100 80GB holds the bf16 model; use int8-quanto on a 40GB card
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  preprocessed_data_root: /content/work/data/.precomputed
+  num_dataloader_workers: 2
+
+validation:
+  interval: null # off; check checkpoints with a restoration run instead
+  generate_audio: false
+
+checkpoints:
+  interval: 250
+  keep_last_n: 3
+  precision: bfloat16
+  save_training_state: minimal
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+  timestep_sampling_params: {}
+
+seed: 42
+output_dir: /content/drive/MyDrive/reveil/runs/ic_lora_512
