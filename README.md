@@ -9,7 +9,7 @@
 
 ## 訓練資料
 
-只能用合法取得、所有演出者都確認成年的無碼影片。
+只能用合法取得、所有演出者都確認成年的無碼影片。訓練是在無碼畫面上打假馬賽克，讓模型學著還原成原本的畫面，所以原片就是正確答案：有碼片（包括 AI 去碼的版本）不能用。影片要夠多、夠多樣（建議 20 部以上、不同演員和場景）；配對太少，模型只會背下那幾段。
 
 每部影片需要一個區域標註檔 `regions/<影片檔名>.json`，標出馬賽克要打在哪裡。可以用下面的[自動標註](#自動標註)產生，或用任何偵測或標註工具輸出這個格式：
 
@@ -30,7 +30,7 @@
 
 ### 自動標註
 
-`reveil.annotate` 用 YOLO 偵測或分割模型逐格找出要打碼的區域，寫成上面的標註檔：
+`reveil.annotate` 用 YOLO 偵測或分割模型，在無碼影片裡逐格找出要打假馬賽克的部位，寫成上面的標註檔。它找的是露出的部位，不是找馬賽克（還原有碼片時找馬賽克是推論階段的事）：
 
 ```bash
 pip install -e ".[annotate]"  # onnxruntime；用 GPU 的話改裝 onnxruntime-gpu
@@ -87,7 +87,7 @@ mosaic: {block_fraction: [0.008, 0.015], blur_probability: 0.0}
 - Colab 密鑰 `HF_TOKEN`（先在 Hugging Face 同意 LTX-2.5 的條款）
 - Drive 上的 `reveil/sources/`（原始影片）；`reveil/regions/`（標註）會自動產生，也可以自己放
 
-notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。偵測模型第一次匯出成 ONNX 後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。
+notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。偵測模型第一次匯出成 ONNX 後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。正式訓練的配對少於 `MIN_SAMPLES`（預設 100）時，notebook 會停下來不訓練。
 
 訓練設定在 `configs/ic_lora_512.yaml`：LoRA rank 32、學習率 2e-4、3000 步、batch 1、bf16、gradient checkpointing；只有 reference 條件，沒有 first_frame 條件。
 
