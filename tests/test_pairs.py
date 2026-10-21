@@ -2,6 +2,7 @@ import json
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from reveil.camera import CameraConfig
 from reveil.make_pairs import load_config, main
@@ -84,6 +85,17 @@ def test_cli_smoke_run_with_random_regions(make_video, tmp_path):
     rows = [json.loads(line) for line in (out / "dataset.jsonl").read_text().splitlines()]
     assert len(rows) == 1 and rows[0]["caption"] == "x"
     assert (out / rows[0]["reference_video"]).is_file()
+
+
+def test_cli_explains_missing_videos_and_region_files(make_video, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(SystemExit, match="no videos"):
+        main(["--videos", str(empty), "--random-regions", "--out", str(tmp_path / "out")])
+    video = make_video(frames=10)
+    (tmp_path / "regions").mkdir()
+    with pytest.raises(SystemExit, match=r"none of the 1 videos has a region file .*clip\.json"):
+        main(["--videos", str(video.parent), "--regions", str(tmp_path / "regions"), "--out", str(tmp_path / "out")])
 
 
 def test_config_rejects_unknown_fields(tmp_path):

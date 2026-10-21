@@ -79,12 +79,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.caption is not None:
         config = replace(config, caption=args.caption)
 
+    videos = find_videos(args.videos)
+    if not videos:
+        sys.exit(f"reveil-make-pairs: no videos ({', '.join(sorted(VIDEO_SUFFIXES))}) in {', '.join(map(str, args.videos))}")
     jobs: list[tuple[Path, Path | None]] = []
     stems: dict[str, Path] = {}
-    for video in find_videos(args.videos):
+    for video in videos:
         stem = safe_stem(video)
         if stem in stems:
-            parser.error(f"{video} and {stems[stem]} share the name {stem!r}; rename one")
+            sys.exit(f"reveil-make-pairs: {video} and {stems[stem]} share the name {stem!r}; rename one")
         stems[stem] = video
         if args.random_regions:
             jobs.append((video, None))
@@ -95,7 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"skip {video}: no {regions}", file=sys.stderr)
     if not jobs:
-        parser.error("no videos to process")
+        sys.exit(
+            f"reveil-make-pairs: none of the {len(videos)} videos has a region file in {args.regions} "
+            f"(e.g. {videos[0].stem}.json); add region files, or use --random-regions for a smoke test"
+        )
 
     args.out.mkdir(parents=True, exist_ok=True)
     failed = 0
