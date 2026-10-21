@@ -75,6 +75,24 @@ def test_excluded_boxes_are_cut_out_of_the_kept_regions():
     assert [r.box for r in detection_regions(apart, 100, 100, AnnotateConfig(grow=0.0))] == [(20, 20, 60, 60)]
 
 
+def test_regions_carry_their_detection_scores():
+    found = FrameDetections(np.array([[0.0, 10, 30, 40], [60.0, 10, 90, 40]]), np.array([0.9, 0.3]), np.array([0, 0]),
+                            None, excluded=np.array([[20.0, 30, 40, 50]]))
+    first, second = sorted(detection_regions(found, 200, 100, AnnotateConfig(grow=0.0)), key=lambda r: r.box)
+    assert first.polygon is not None and first.score == pytest.approx(0.9)  # cut by the excluded box
+    assert second.score == pytest.approx(0.3)
+    assert Region.from_json(second.to_json()).score == pytest.approx(0.3)
+
+
+def test_tracks_the_detector_was_unsure_of_are_dropped():
+    frames = {f: [Region((10 + f, 10, 40 + f, 40), score=0.8), Region((200, 10, 230, 40), score=0.3)]
+              for f in range(60)}
+    frames[30] = frames[30][:1] + [Region((200, 10, 230, 40), score=0.9)]  # one confident frame is not enough
+    kept, dropped = smooth_tracks(RegionSet(frames), 30.0, AnnotateConfig())
+    assert all(len(v) == 1 and v[0].box[0] < 100 for v in kept.frames.values()) and len(kept.frames) == 60
+    assert sorted(dropped) == list(range(60)) and all(v[0].box[0] == 200 for v in dropped.values())
+
+
 def test_cut_detector_flags_hard_cuts_only():
     frames = list(square_frames(20, cut_at=10))
     detect = CutDetector(30.0)
@@ -85,7 +103,8 @@ def test_tracks_fill_gaps_by_moving_regions_and_drop_short_ones():
     square = lambda x: Region.from_json({"polygon": [[x, 0], [x + 10, 0], [x + 10, 10], [x, 10]]})  # noqa: E731
     frames = {f: [square(f)] for f in range(40) if not 10 <= f < 14}
     frames.update({f: [Region((500, 500, 520, 520))] for f in range(100, 105)})
-    smoothed = smooth_tracks(RegionSet(frames), 30.0, AnnotateConfig(max_gap_seconds=0.2, min_track_seconds=0.5))
+    smoothed, dropped = smooth_tracks(RegionSet(frames), 30.0, AnnotateConfig(max_gap_seconds=0.2, min_track_seconds=0.5))
+    assert not dropped
     assert sorted(smoothed.frames) == list(range(40))
     (moved,) = smoothed.frames[12]
     assert moved.box == pytest.approx((12, 0, 22, 10))

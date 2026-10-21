@@ -36,6 +36,7 @@ class Region:
 
     box: Box
     polygon: np.ndarray | None = None  # (N, 2) float32 points in source pixels
+    score: float | None = None  # detector confidence, when it came from a detector
 
     @classmethod
     def from_json(cls, item: dict) -> Region:
@@ -45,16 +46,20 @@ class Region:
                 raise ValueError("a polygon region needs at least 3 points")
             x0, y0 = points.min(axis=0)
             x1, y1 = points.max(axis=0)
-            return cls((float(x0), float(y0), float(x1), float(y1)), points)
+            return cls((float(x0), float(y0), float(x1), float(y1)), points, item.get("score"))
         x0, y0, x1, y1 = (float(v) for v in item["box"])
         if x1 <= x0 or y1 <= y0:
             raise ValueError(f"empty box {item['box']}")
-        return cls((x0, y0, x1, y1))
+        return cls((x0, y0, x1, y1), score=item.get("score"))
 
     def to_json(self) -> dict:
         if self.polygon is not None:
-            return {"polygon": [[_compact(x), _compact(y)] for x, y in self.polygon.tolist()]}
-        return {"box": [_compact(v) for v in self.box]}
+            item = {"polygon": [[_compact(x), _compact(y)] for x, y in self.polygon.tolist()]}
+        else:
+            item = {"box": [_compact(v) for v in self.box]}
+        if self.score is not None:
+            item["score"] = round(float(self.score), 2)
+        return item
 
 
 def _compact(value: float) -> float | int:
@@ -83,12 +88,16 @@ def load_regions(path: str | Path) -> RegionSet:
     return RegionSet(frames, frozenset(int(cut) for cut in data.get("cuts", [])))
 
 
-def save_regions(regions: RegionSet, path: str | Path) -> None:
+def save_regions(regions: RegionSet, path: str | Path, *, dropped: dict[int, list[Region]] | None = None) -> None:
+    """``dropped``: regions a detector found but that are not to be censored (kept for
+    previews and for checking thresholds; loaders ignore them)."""
     data = {
         "version": 1,
         "frames": {str(index): [r.to_json() for r in items] for index, items in sorted(regions.frames.items())},
         "cuts": sorted(regions.cuts),
     }
+    if dropped:
+        data["dropped"] = {str(index): [r.to_json() for r in items] for index, items in sorted(dropped.items())}
     path = Path(path)
     partial = path.with_name(path.name + ".part")
     partial.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")

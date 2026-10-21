@@ -7,7 +7,9 @@ Every frame (or every ``stride``-th) goes through a YOLO detect or segment model
 boxes become box regions, both grown a little. Boxes of excluded classes (say the anus,
 which releases leave uncensored) are cut out of them. Regions are linked into tracks; tracks
 shorter than ``min_track_seconds`` are dropped and gaps up to ``max_gap_seconds`` are
-filled by moving the nearer frame's regions along the interpolated box. Scene cuts found
+filled by moving the nearer frame's regions along the interpolated box; tracks whose median
+detector score is under ``min_track_score`` (say a hand taken for genitals) are kept apart as
+dropped, shown in red on the previews. Scene cuts found
 from frame differences go into the file too, so no track or training window spans one.
 Videos that already have a region file are skipped, so an interrupted run resumes, as long
 as the settings recorded next to the region files are unchanged; otherwise every video is
@@ -21,7 +23,7 @@ import json
 import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -46,6 +48,7 @@ class AnnotateConfig:
     simplify: float = 0.005  # polygon simplification, fraction of the outline's length
     max_gap_seconds: float = 0.5  # missed detections bridged within a track
     min_track_seconds: float = 1.0  # shorter tracks are dropped
+    min_track_score: float = 0.4  # tracks whose median detector score is lower are dropped (a hand taken for genitals)
     cut_threshold: float = 30.0  # mean grey difference (0-255) of 64x36 thumbnails at a cut
     preview_frames: int = 12
 
@@ -71,10 +74,9 @@ def mask_regions(mask: np.ndarray, *, grow_px: int, min_area_px: float, simplify
     return regions
 
 
-def _grown_boxes(boxes: np.ndarray, grow_px: int, frame_w: int, frame_h: int) -> list[Box]:
-    grown = (clip_box((x0 - grow_px, y0 - grow_px, x1 + grow_px, y1 + grow_px), frame_w, frame_h)
-             for x0, y0, x1, y1 in boxes.tolist())
-    return [box for box in grown if box is not None]
+def _grow(box: list[float], grow_px: int, frame_w: int, frame_h: int) -> Box | None:
+    x0, y0, x1, y1 = box
+    return clip_box((x0 - grow_px, y0 - grow_px, x1 + grow_px, y1 + grow_px), frame_w, frame_h)
 
 
 def _overlap(a: Box, b: Box) -> bool:
@@ -87,28 +89,32 @@ def _paint(mask: np.ndarray, box: Box, value: bool) -> None:
 
 
 def detection_regions(detections: FrameDetections, frame_w: int, frame_h: int, config: AnnotateConfig) -> list[Region]:
-    """Regions of the kept detections, grown a little; the boxes of excluded classes (grown
-    as much) are cut out of them."""
+    """Regions of the kept detections, grown a little, each with the best score of the
+    detections it came from; the boxes of excluded classes (grown as much) are cut out."""
     grow_px = round(config.grow * min(frame_w, frame_h))
     min_area_px = config.min_area * frame_w * frame_h
-    excluded = _grown_boxes(detections.excluded, grow_px, frame_w, frame_h)
+    excluded = [box for box in (_grow(b, grow_px, frame_w, frame_h) for b in detections.excluded.tolist()) if box]
+    scored = [(box, float(score)) for box, score in
+              zip((_grow(b, grow_px, frame_w, frame_h) for b in detections.boxes.tolist()), detections.scores.tolist())
+              if box is not None]
+    if detections.mask is None and not any(_overlap(box, cut) for box, _ in scored for cut in excluded):
+        return [Region(box, score=score) for box, score in scored
+                if (box[2] - box[0]) * (box[3] - box[1]) >= min_area_px]
     if detections.mask is not None:
-        mask = detections.mask
-        if excluded:
-            mask = mask.copy()
-            for box in excluded:
-                _paint(mask, box, False)
-        return mask_regions(mask, grow_px=grow_px, min_area_px=min_area_px, simplify=config.simplify)
-    boxes = [box for box in _grown_boxes(detections.boxes, grow_px, frame_w, frame_h)
-             if (box[2] - box[0]) * (box[3] - box[1]) >= min_area_px]
-    if not any(_overlap(box, cut) for box in boxes for cut in excluded):
-        return [Region(box) for box in boxes]
-    mask = np.zeros((frame_h, frame_w), dtype=bool)
-    for box in boxes:
-        _paint(mask, box, True)
+        mask, grow = (detections.mask.copy() if excluded else detections.mask), grow_px
+    else:
+        mask, grow = np.zeros((frame_h, frame_w), dtype=bool), 0
+        for box, _ in scored:
+            _paint(mask, box, True)
     for box in excluded:
         _paint(mask, box, False)
-    return mask_regions(mask, grow_px=0, min_area_px=min_area_px, simplify=config.simplify)
+    regions = mask_regions(mask, grow_px=grow, min_area_px=min_area_px, simplify=config.simplify)
+    return [_with_score(region, scored) for region in regions]
+
+
+def _with_score(region: Region, scored: list[tuple[Box, float]]) -> Region:
+    scores = [score for box, score in scored if _overlap(region.box, box)]
+    return replace(region, score=max(scores)) if scores else region
 
 
 class CutDetector:
@@ -144,51 +150,71 @@ def _move(region: Region, source: Box, target: Box) -> Region:
             [target[0] + (region.polygon[:, 0] - source[0]) * sx, target[1] + (region.polygon[:, 1] - source[1]) * sy],
             axis=1,
         )
-        return Region.from_json({"polygon": points.tolist()})
+        return replace(Region.from_json({"polygon": points.tolist()}), score=region.score)
     x0, y0, x1, y1 = region.box
     return Region(
         (target[0] + (x0 - source[0]) * sx, target[1] + (y0 - source[1]) * sy,
-         target[0] + (x1 - source[0]) * sx, target[1] + (y1 - source[1]) * sy)
+         target[0] + (x1 - source[0]) * sx, target[1] + (y1 - source[1]) * sy),
+        score=region.score,
     )
 
 
-def smooth_tracks(regions: RegionSet, fps: float, config: AnnotateConfig) -> RegionSet:
-    """Per-frame detections as tracks: short tracks dropped, gaps filled."""
+def _track_score(track) -> float | None:
+    """Median over the detected frames of a track of their best region score."""
+    scores = [max(r.score for r in group if r.score is not None)
+              for group, filled in zip(track.regions, track.filled)
+              if not filled and any(r.score is not None for r in group)]
+    return float(np.median(scores)) if scores else None
+
+
+def smooth_tracks(
+    regions: RegionSet, fps: float, config: AnnotateConfig
+) -> tuple[RegionSet, dict[int, list[Region]]]:
+    """Per-frame detections as tracks: short tracks dropped, gaps filled. Tracks the detector
+    was unsure of (median score under ``min_track_score``) come back separately, as dropped."""
     max_gap = max(config.stride - 1, round(config.max_gap_seconds * fps))
     min_frames = round(config.min_track_seconds * fps)
     frames: dict[int, list[Region]] = {}
+    dropped: dict[int, list[Region]] = {}
     for track in build_tracks(regions, max_gap=max_gap):
         if len(track.boxes) < min_frames:
             continue
+        score = _track_score(track)
+        target = dropped if score is not None and score < config.min_track_score else frames
         for offset, (box, group, filled) in enumerate(zip(track.boxes, track.regions, track.filled)):
             if filled:
                 source = union_box(group)
                 group = [_move(region, source, box) for region in group]
-            frames.setdefault(track.start + offset, []).extend(group)
-    return RegionSet(frames, regions.cuts)
+            target.setdefault(track.start + offset, []).extend(group)
+    return RegionSet(frames, regions.cuts), dropped
 
 
-def _draw(frame: np.ndarray, regions: list[Region], scale: float) -> np.ndarray:
-    image = frame.copy()
+def _draw(image: np.ndarray, regions: list[Region], scale: float, color: tuple[int, int, int]) -> None:
     for region in regions:
         if region.polygon is not None:
             points = np.round(region.polygon * scale).astype(np.int32)
-            cv2.polylines(image, [points], True, (0, 255, 0), 2)
+            cv2.polylines(image, [points], True, color, 2)
         else:
             x0, y0, x1, y1 = (round(v * scale) for v in region.box)
-            cv2.rectangle(image, (x0, y0), (x1, y1), (0, 255, 0), 2)
-    return image
+            cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
 
 
-def write_preview(samples: dict[int, np.ndarray], regions: RegionSet, scale: float, path: Path, count: int) -> None:
-    """A grid of sampled frames (RGB, already scaled by ``scale``) with their regions outlined."""
-    marked = [i for i in sorted(samples) if i in regions.frames] or sorted(samples)
+def write_preview(
+    samples: dict[int, np.ndarray], regions: RegionSet, scale: float, path: Path, count: int,
+    dropped: dict[int, list[Region]] | None = None,
+) -> None:
+    """A grid of sampled frames (RGB, already scaled by ``scale``): the regions to censor
+    outlined in green, dropped ones in red."""
+    dropped = dropped or {}
+    marked = [i for i in sorted(samples) if i in regions.frames or i in dropped] or sorted(samples)
     if not marked:
         return
     chosen = [marked[round(k * (len(marked) - 1) / max(count - 1, 1))] for k in range(min(count, len(marked)))]
     tiles = []
     for index in dict.fromkeys(chosen):
-        tile = _draw(samples[index], regions.frames.get(index, []), scale)
+        tile = samples[index].copy()
+        _draw(tile, dropped.get(index, []), scale, (255, 0, 0))
+        _draw(tile, regions.frames.get(index, []), scale, (0, 255, 0))
         cv2.putText(tile, str(index), (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         tiles.append(tile)
     columns = min(4, len(tiles))
@@ -253,18 +279,19 @@ def annotate_video(
     if batch:
         flush()
 
-    regions = smooth_tracks(RegionSet(detected, frozenset(cuts)), info.fps, config)
+    regions, dropped = smooth_tracks(RegionSet(detected, frozenset(cuts)), info.fps, config)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    save_regions(regions, out_path)
+    save_regions(regions, out_path, dropped=dropped)
     if preview_path is not None:
-        write_preview(samples, regions, scale, Path(preview_path), config.preview_frames)
+        write_preview(samples, regions, scale, Path(preview_path), config.preview_frames, dropped)
     return {
         "size": f"{info.width}x{info.height}",
         "frames": frame_count,
         "detected_frames": len(detected),
         "region_frames": len(regions.frames),
         "region_seconds": round(len(regions.frames) / info.fps, 1),
+        "dropped_seconds": round(len(dropped) / info.fps, 1),
         "cuts": len(cuts),
     }
 
@@ -303,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stride", type=int, default=AnnotateConfig.stride)
     parser.add_argument("--grow", type=float, default=AnnotateConfig.grow)
     parser.add_argument("--min-track-seconds", type=float, default=AnnotateConfig.min_track_seconds)
+    parser.add_argument("--min-track-score", type=float, default=AnnotateConfig.min_track_score,
+                        help="drop tracks whose median detector score is lower")
     parser.add_argument("--max-gap-seconds", type=float, default=AnnotateConfig.max_gap_seconds)
     parser.add_argument("--preview-dir", type=Path, help="write <video name>.jpg previews here")
     parser.add_argument("--workers", type=int, default=1, help="videos annotated at once, each with its own model")
@@ -315,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     config = AnnotateConfig(
         batch=args.batch, stride=args.stride, grow=args.grow,
         min_track_seconds=args.min_track_seconds, max_gap_seconds=args.max_gap_seconds,
+        min_track_score=args.min_track_score,
     )
     videos = find_videos(args.videos)
     if not videos:
@@ -336,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         "exclude": detector.excluded_classes, "conf": args.conf, "iou": args.iou, "imgsz": detector.size,
         "stride": config.stride, "grow": config.grow,
         "min_track_seconds": config.min_track_seconds, "max_gap_seconds": config.max_gap_seconds,
+        "min_track_score": config.min_track_score,
     }
     settings_path = args.out / SETTINGS_FILE
     try:
