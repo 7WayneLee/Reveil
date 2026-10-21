@@ -11,7 +11,7 @@
 
 只能用合法取得、所有演出者都確認成年的無碼影片。
 
-每部影片需要一個區域標註檔 `regions/<影片檔名>.json`，標出馬賽克要打在哪裡；任何偵測或標註工具輸出這個格式即可：
+每部影片需要一個區域標註檔 `regions/<影片檔名>.json`，標出馬賽克要打在哪裡。可以用下面的[自動標註](#自動標註)產生，或用任何偵測或標註工具輸出這個格式：
 
 ```json
 {
@@ -27,6 +27,24 @@
 - frame key 是從 0 起算的解碼影格編號，座標是原始像素。
 - 有 `polygon` 時馬賽克照輪廓打；只有 `box` 時隨機用矩形或內切橢圓。
 - `cuts` 可省略：每個場景切換後的第一格，track 和視窗不會跨過它。
+
+### 自動標註
+
+`reveil.annotate` 用 YOLO 偵測或分割模型逐格找出要打碼的區域，寫成上面的標註檔：
+
+```bash
+pip install -e ".[annotate]"  # onnxruntime；用 GPU 的話改裝 onnxruntime-gpu
+python -m reveil.annotate --videos sources/ --model detector.onnx --out regions/ --preview-dir previews/
+```
+
+- 模型要先用 ultralytics 匯出成 ONNX：`yolo export model=<權重>.pt format=onnx dynamic=True`。Reveil 只讀 ONNX 檔，不 import ultralytics。
+- 分割模型的遮罩變成輪廓多邊形，偵測模型的框變成方框，都會再外擴一點（`--grow`，畫面短邊的比例）。
+- 每格的偵測結果會連成 track：短於 `--min-track-seconds` 的丟掉，`--max-gap-seconds` 以內的漏偵測用前後影格補上。偵測到的場景切換寫進 `cuts`。
+- `--classes` 只保留指定類別（名稱或編號），`--conf` 是分數門檻，`--stride N` 每 N 格偵測一次（中間的影格會補上）。執行時會印出模型的所有類別。
+- `--preview-dir` 每部影片輸出一張預覽圖，綠線是標註；產生配對前先看過。
+- 已經有標註檔的影片會跳過，`--overwrite` 重做。
+
+Colab notebook 預設用 [Lada](https://github.com/ladaapp/lada) 的 NSFW 分割模型 `lada_nsfw_detection_model_v1.3`（Hugging Face `ladaapp/lada`）。
 
 產生配對：
 
@@ -67,9 +85,9 @@ mosaic: {block_fraction: [0.008, 0.015], blur_probability: 0.0}
 
 - A100 80GB 執行階段
 - Colab 密鑰 `HF_TOKEN`（先在 Hugging Face 同意 LTX-2.5 的條款）
-- Drive 上的 `reveil/sources/`（原始影片）和 `reveil/regions/`（標註）
+- Drive 上的 `reveil/sources/`（原始影片）；`reveil/regions/`（標註）會自動產生，也可以自己放
 
-notebook 依序安裝、下載 LTX-2.5（約 72 GB）、產生配對、前處理、訓練。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`，確認整條流程能跑通。
+notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。偵測模型第一次匯出成 ONNX 後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。
 
 訓練設定在 `configs/ic_lora_512.yaml`：LoRA rank 32、學習率 2e-4、3000 步、batch 1、bf16、gradient checkpointing；只有 reference 條件，沒有 first_frame 條件。
 
@@ -85,3 +103,5 @@ pytest
 ## 授權
 
 Reveil 的程式碼採用 Apache-2.0。LTX-2.5 的權重和 Lightricks 的 `ltx-trainer` 屬於 LTX-2.x Community License，使用時須遵守該授權及其 Acceptable Use Policy。
+
+Lada 的偵測模型和匯出用的 ultralytics 都是 AGPL-3.0。Reveil 不包含它們，也不 import 它們：notebook 在你的執行階段下載模型，並用獨立的 `yolo` 指令匯出。
