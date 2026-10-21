@@ -101,6 +101,20 @@ def test_excluded_classes_come_back_as_separate_boxes(tmp_path):
         YoloOnnx(path, DetectorConfig(classes=("genitalia", "anus"), exclude=("anus",)))
 
 
+def test_doubt_classes_come_back_as_separate_boxes(tmp_path):
+    from reveil.detect import YoloOnnx
+
+    path = write_yolo_onnx(tmp_path / "det.onnx", task="detect", names=("genitalia", "face", "anus"))
+    detector = YoloOnnx(path, DetectorConfig(classes=("genitalia",), exclude=("anus",), doubt=("face",)))
+    assert detector.doubt_classes == ["face"]
+    found = detector([np.zeros((96, 128, 3), np.uint8)])[0]
+    np.testing.assert_allclose(found.boxes, [[48, 32, 80, 64]], atol=0.01)
+    np.testing.assert_allclose(found.doubt, [[92, 76, 108, 92]], atol=0.01)
+    assert found.excluded.shape == (0, 4)
+    with pytest.raises(ValueError, match="neither kept nor excluded"):
+        YoloOnnx(path, DetectorConfig(classes=("genitalia",), exclude=("face",), doubt=("face",)))
+
+
 def test_detect_model_and_unknown_classes(tmp_path):
     from reveil.detect import YoloOnnx
 

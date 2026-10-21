@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from conftest import write_yolo_onnx
-from reveil.annotate import AnnotateConfig, CutDetector, annotate_video, detection_regions, main, mask_regions, smooth_tracks
+from reveil.annotate import (
+    AnnotateConfig, CutDetector, annotate_video, detection_regions, main, mark_flat, mask_regions, smooth_tracks,
+)
 from reveil.detect import FrameDetections
 from reveil.pairs import PairConfig, build_video_pairs
 from reveil.camera import CameraConfig
@@ -87,6 +89,40 @@ def test_regions_carry_their_detection_scores():
     assert Region.from_json(second.to_json()).score == pytest.approx(0.3)
 
 
+def test_detections_mostly_inside_a_doubt_box_are_doubtful():
+    face = np.array([[0.0, 0, 100, 100]])
+    found = FrameDetections(np.array([[20.0, 50, 80, 110], [60.0, 60, 140, 140]]), np.array([0.9, 0.8]),
+                            np.array([0, 0]), None, doubt=face)  # 5/6 and 1/4 inside the face
+    inside, apart = sorted(detection_regions(found, 200, 200, AnnotateConfig(grow=0.0)), key=lambda r: r.box)
+    assert inside.doubt == "inside" and apart.doubt is None
+    assert Region.from_json(inside.to_json()).doubt == "inside"
+    assert all(r.doubt is None for r in detection_regions(found, 200, 200, AnnotateConfig(grow=0.0, doubt_inside=0.9)))
+    # cut by an excluded box, a region is doubtful only when all its detections are
+    cut = FrameDetections(found.boxes[:1], found.scores[:1], found.classes[:1], None,
+                          excluded=np.array([[70.0, 100, 90, 120]]), doubt=face)
+    (region,) = detection_regions(cut, 200, 200, AnnotateConfig(grow=0.0))
+    assert region.polygon is not None and region.doubt == "inside"
+
+
+def test_regions_over_an_even_patch_are_doubtful():
+    frame = np.full((100, 200, 3), 12, np.uint8)
+    frame[:, 100:] = np.random.default_rng(0).integers(0, 255, size=(100, 100, 3), dtype=np.uint8)
+    dark, busy = mark_flat([Region((10, 10, 60, 60)), Region((120, 10, 170, 60))], frame, 8.0)
+    assert dark.doubt == "flat" and busy.doubt is None
+    assert mark_flat([Region((10, 10, 60, 60))], frame, 0.0)[0].doubt is None  # turned off
+
+
+def test_mostly_doubtful_tracks_are_dropped():
+    def frames(doubtful):
+        return {f: [Region((10, 10, 40, 40), score=0.9, doubt="inside" if f in doubtful else None)] for f in range(60)}
+
+    kept, dropped = smooth_tracks(RegionSet(frames(range(35))), 30.0, AnnotateConfig(min_track_score=0.0))
+    assert not kept.frames and len(dropped) == 60
+    kept, dropped = smooth_tracks(RegionSet(frames(range(20))), 30.0, AnnotateConfig())
+    assert len(kept.frames) == 60 and not dropped  # a real one, now and then inside a face
+    assert kept.frames[5][0].doubt == "inside"
+
+
 def test_tracks_the_detector_was_unsure_of_are_dropped():
     frames = {f: [Region((10 + f, 10, 40 + f, 40), score=0.8), Region((200, 10, 230, 40), score=0.3)]
               for f in range(60)}
@@ -138,6 +174,28 @@ def test_annotate_video_writes_regions_cuts_and_a_preview(tmp_path):
     assert len(rows) == 1 and rows[0]["start"] + 121 <= 200
 
 
+class BoxDetector:
+    """Finds the same box on every frame."""
+
+    def __init__(self, box):
+        self.box = np.array([box], dtype=float)
+
+    def __call__(self, frames):
+        return [FrameDetections(self.box, np.array([0.9]), np.array([0]), None) for _ in frames]
+
+
+def test_a_box_on_dark_frames_is_dropped(tmp_path):
+    video = tmp_path / "dark.mp4"
+    write_video(video, (np.full((240, 320, 3), 14, np.uint8) for _ in range(60)), 30.0, crf=16)
+    out = tmp_path / "dark.json"
+    summary = annotate_video(video, BoxDetector((100, 80, 200, 160)), out, AnnotateConfig(), preview_path=tmp_path / "p.jpg")
+    assert summary["region_frames"] == 0 and summary["dropped_seconds"] == 2.0
+    assert not load_regions(out).frames
+    assert json.loads(out.read_text())["dropped"]["0"][0]["doubt"] == "flat"
+    summary = annotate_video(tmp_path / "dark.mp4", BoxDetector((100, 80, 200, 160)), out, AnnotateConfig(min_contrast=0))
+    assert summary["region_frames"] == 60
+
+
 def test_detection_runs_at_the_model_size_and_maps_back_to_video_pixels(tmp_path):
     video = tmp_path / "clip.mp4"
     write_video(video, square_frames(40), 30.0, crf=16)  # 320x240
@@ -167,7 +225,8 @@ def test_cli_with_an_onnx_model_skips_finished_videos(tmp_path):
     model = write_yolo_onnx(tmp_path / "seg.onnx")
     out = tmp_path / "regions"
     args = ["--videos", str(videos), "--out", str(out), "--model", str(model), "--classes", "region",
-            "--min-track-seconds", "0.5", "--preview-dir", str(tmp_path / "previews")]
+            "--min-track-seconds", "0.5", "--preview-dir", str(tmp_path / "previews"),
+            "--min-contrast", "0"]  # the stand-in model's box ignores the picture
     assert main(args) == 0
     data = json.loads((out / "a.json").read_text())
     assert len(data["frames"]) == 40

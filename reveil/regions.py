@@ -37,6 +37,7 @@ class Region:
     box: Box
     polygon: np.ndarray | None = None  # (N, 2) float32 points in source pixels
     score: float | None = None  # detector confidence, when it came from a detector
+    doubt: str | None = None  # why the detection is doubtful ("inside" a face, "flat" image), if it is
 
     @classmethod
     def from_json(cls, item: dict) -> Region:
@@ -46,11 +47,11 @@ class Region:
                 raise ValueError("a polygon region needs at least 3 points")
             x0, y0 = points.min(axis=0)
             x1, y1 = points.max(axis=0)
-            return cls((float(x0), float(y0), float(x1), float(y1)), points, item.get("score"))
+            return cls((float(x0), float(y0), float(x1), float(y1)), points, item.get("score"), item.get("doubt"))
         x0, y0, x1, y1 = (float(v) for v in item["box"])
         if x1 <= x0 or y1 <= y0:
             raise ValueError(f"empty box {item['box']}")
-        return cls((x0, y0, x1, y1), score=item.get("score"))
+        return cls((x0, y0, x1, y1), score=item.get("score"), doubt=item.get("doubt"))
 
     def to_json(self) -> dict:
         if self.polygon is not None:
@@ -59,6 +60,8 @@ class Region:
             item = {"box": [_compact(v) for v in self.box]}
         if self.score is not None:
             item["score"] = round(float(self.score), 2)
+        if self.doubt:
+            item["doubt"] = self.doubt
         return item
 
 

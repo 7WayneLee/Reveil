@@ -5,12 +5,14 @@
 Every frame (or every ``stride``-th) goes through a YOLO detect or segment model
 (``reveil.detect``): a segment model's mask becomes outline polygons, a detect model's
 boxes become box regions, both grown a little. Boxes of excluded classes (say the anus,
-which releases leave uncensored) are cut out of them. Regions are linked into tracks; tracks
+which releases leave uncensored) are cut out of them. A detection mostly inside a box of a
+doubt class (a mouth inside a face, taken for genitals) or over an almost even patch of
+image (a dark frame where nothing shows) is doubtful. Regions are linked into tracks; tracks
 shorter than ``min_track_seconds`` are dropped and gaps up to ``max_gap_seconds`` are
-filled by moving the nearer frame's regions along the interpolated box; tracks whose median
-detector score is under ``min_track_score`` (say a hand taken for genitals) are kept apart as
-dropped, shown in red on the previews. Scene cuts found
-from frame differences go into the file too, so no track or training window spans one.
+filled by moving the nearer frame's regions along the interpolated box; tracks of mostly
+doubtful detections, or whose median detector score is under ``min_track_score`` (say a
+hand taken for genitals), are kept apart as dropped, shown in red on the previews. Scene
+cuts found from frame differences go into the file too, so no track or training window spans one.
 Videos that already have a region file are skipped, so an interrupted run resumes, as long
 as the settings recorded next to the region files are unchanged; otherwise every video is
 annotated again.
@@ -36,7 +38,7 @@ from reveil.video import probe, read_frames
 
 PREVIEW_WIDTH = 480
 SETTINGS_FILE = "annotate_settings.json"
-SETTINGS_VERSION = 4  # raised when old region files must be redone (the annotation changed, or stray runs wrote some)
+SETTINGS_VERSION = 5  # raised when old region files must be redone (the annotation changed, or stray runs wrote some)
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,8 @@ class AnnotateConfig:
     max_gap_seconds: float = 0.5  # missed detections bridged within a track
     min_track_seconds: float = 1.0  # shorter tracks are dropped
     min_track_score: float = 0.4  # tracks whose median detector score is lower are dropped (a hand taken for genitals)
+    doubt_inside: float = 0.7  # a detection this much inside a doubt-class box is doubtful (a mouth inside a face)
+    min_contrast: float = 8.0  # a region whose grey levels (0-255) vary less is doubtful (a dark frame showing nothing)
     cut_threshold: float = 30.0  # mean grey difference (0-255) of 64x36 thumbnails at a cut
     preview_frames: int = 12
 
@@ -88,19 +92,37 @@ def _paint(mask: np.ndarray, box: Box, value: bool) -> None:
     mask[int(y0) : int(np.ceil(y1)), int(x0) : int(np.ceil(x1))] = value
 
 
+def _inside(boxes: np.ndarray, doubt: np.ndarray, frame_w: int, frame_h: int, share: float) -> list[bool]:
+    """Per box: whether at least ``share`` of it lies inside the ``doubt`` boxes."""
+    if not len(doubt):
+        return [False] * len(boxes)
+    cover = np.zeros((frame_h, frame_w), dtype=bool)
+    for box in (clip_box(tuple(b), frame_w, frame_h) for b in doubt.tolist()):
+        if box is not None:
+            _paint(cover, box, True)
+    inside = []
+    for box in (clip_box(tuple(b), frame_w, frame_h) for b in boxes.tolist()):
+        cells = None if box is None else cover[int(box[1]) : int(np.ceil(box[3])), int(box[0]) : int(np.ceil(box[2]))]
+        inside.append(cells is not None and cells.size > 0 and float(cells.mean()) >= share)
+    return inside
+
+
 def detection_regions(detections: FrameDetections, frame_w: int, frame_h: int, config: AnnotateConfig) -> list[Region]:
     """Regions of the kept detections, grown a little, each with the best score of the
-    detections it came from. The boxes of excluded classes (grown as much) are cut out, but
-    never from inside a kept detection's own box: the genitals stay covered even where the
-    anus box reaches into them."""
+    detections it came from; those from detections mostly inside a doubt-class box (a mouth
+    inside a face, taken for genitals) are doubtful. The boxes of excluded classes (grown as
+    much) are cut out, but never from inside a kept detection's own box: the genitals stay
+    covered even where the anus box reaches into them."""
     grow_px = round(config.grow * min(frame_w, frame_h))
     min_area_px = config.min_area * frame_w * frame_h
     excluded = [box for box in (_grow(b, grow_px, frame_w, frame_h) for b in detections.excluded.tolist()) if box]
-    scored = [(box, float(score)) for box, score in
-              zip((_grow(b, grow_px, frame_w, frame_h) for b in detections.boxes.tolist()), detections.scores.tolist())
+    inside = _inside(detections.boxes, detections.doubt, frame_w, frame_h, config.doubt_inside)
+    scored = [(box, float(score), doubt) for box, score, doubt in
+              zip((_grow(b, grow_px, frame_w, frame_h) for b in detections.boxes.tolist()), detections.scores.tolist(),
+                  inside)
               if box is not None]
-    if detections.mask is None and not any(_overlap(box, cut) for box, _ in scored for cut in excluded):
-        return [Region(box, score=score) for box, score in scored
+    if detections.mask is None and not any(_overlap(box, cut) for box, _, _ in scored for cut in excluded):
+        return [Region(box, score=score, doubt="inside" if doubt else None) for box, score, doubt in scored
                 if (box[2] - box[0]) * (box[3] - box[1]) >= min_area_px]
     core = np.zeros((frame_h, frame_w), dtype=bool)
     for box in (clip_box(tuple(b), frame_w, frame_h) for b in detections.boxes.tolist()):
@@ -111,7 +133,7 @@ def detection_regions(detections: FrameDetections, frame_w: int, frame_h: int, c
         core &= detections.mask
     else:
         mask, grow = np.zeros((frame_h, frame_w), dtype=bool), 0
-        for box, _ in scored:
+        for box, _, _ in scored:
             _paint(mask, box, True)
     for box in excluded:
         _paint(mask, box, False)
@@ -120,9 +142,29 @@ def detection_regions(detections: FrameDetections, frame_w: int, frame_h: int, c
     return [_with_score(region, scored) for region in regions]
 
 
-def _with_score(region: Region, scored: list[tuple[Box, float]]) -> Region:
-    scores = [score for box, score in scored if _overlap(region.box, box)]
-    return replace(region, score=max(scores)) if scores else region
+def _with_score(region: Region, scored: list[tuple[Box, float, bool]]) -> Region:
+    """``region`` with the best score of the detections it overlaps, doubtful when they all are."""
+    found = [(score, doubt) for box, score, doubt in scored if _overlap(region.box, box)]
+    if not found:
+        return region
+    return replace(region, score=max(score for score, _ in found),
+                   doubt="inside" if all(doubt for _, doubt in found) else None)
+
+
+def mark_flat(regions: list[Region], frame: np.ndarray, min_contrast: float) -> list[Region]:
+    """``regions`` (in ``frame`` pixels) with those over an almost even patch of ``frame``
+    marked doubtful: in a dark or blank frame a mosaic hides nothing."""
+    if min_contrast <= 0:
+        return regions
+    grey = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    marked = []
+    for region in regions:
+        x0, y0, x1, y1 = region.box
+        patch = grey[max(int(y0), 0) : int(np.ceil(y1)), max(int(x0), 0) : int(np.ceil(x1))]
+        if region.doubt is None and patch.size and float(patch.std()) < min_contrast:
+            region = replace(region, doubt="flat")
+        marked.append(region)
+    return marked
 
 
 class CutDetector:
@@ -158,36 +200,37 @@ def _move(region: Region, source: Box, target: Box) -> Region:
             [target[0] + (region.polygon[:, 0] - source[0]) * sx, target[1] + (region.polygon[:, 1] - source[1]) * sy],
             axis=1,
         )
-        return replace(Region.from_json({"polygon": points.tolist()}), score=region.score)
+        return replace(Region.from_json({"polygon": points.tolist()}), score=region.score, doubt=region.doubt)
     x0, y0, x1, y1 = region.box
-    return Region(
-        (target[0] + (x0 - source[0]) * sx, target[1] + (y0 - source[1]) * sy,
-         target[0] + (x1 - source[0]) * sx, target[1] + (y1 - source[1]) * sy),
-        score=region.score,
+    return replace(
+        region,
+        box=(target[0] + (x0 - source[0]) * sx, target[1] + (y0 - source[1]) * sy,
+             target[0] + (x1 - source[0]) * sx, target[1] + (y1 - source[1]) * sy),
     )
 
 
-def _track_score(track) -> float | None:
-    """Median over the detected frames of a track of their best region score."""
-    scores = [max(r.score for r in group if r.score is not None)
-              for group, filled in zip(track.regions, track.filled)
-              if not filled and any(r.score is not None for r in group)]
-    return float(np.median(scores)) if scores else None
+def _unsure(track, min_score: float) -> bool:
+    """Whether most detected regions of a track are doubtful, or their median score (a
+    doubtful one counting as 0) is under ``min_score``."""
+    found = [region for group, filled in zip(track.regions, track.filled) if not filled for region in group]
+    if 2 * sum(region.doubt is not None for region in found) > len(found):
+        return True
+    scores = [0.0 if region.doubt else region.score for region in found if region.doubt or region.score is not None]
+    return bool(scores) and float(np.median(scores)) < min_score
 
 
 def smooth_tracks(
     regions: RegionSet, fps: float, config: AnnotateConfig
 ) -> tuple[RegionSet, dict[int, list[Region]]]:
     """Per-frame detections as tracks: short tracks dropped, gaps filled. Regions whose own
-    track the detector was unsure of (median score under ``min_track_score``) come back
-    separately, as dropped: each region is followed on its own for this, so a doubtful one
-    beside a sure one (a toy against the genitals) still goes."""
+    track is mostly doubtful or the detector was unsure of (median score under
+    ``min_track_score``) come back separately, as dropped: each region is followed on its own
+    for this, so a doubtful one beside a sure one (a toy against the genitals) still goes."""
     max_gap = max(config.stride - 1, round(config.max_gap_seconds * fps))
     min_frames = round(config.min_track_seconds * fps)
     unsure: set[int] = set()
     for track in build_tracks(regions, max_gap=max_gap, group=False):
-        score = _track_score(track)
-        if score is not None and score < config.min_track_score:
+        if _unsure(track, config.min_track_score):
             unsure.update(id(r) for group, filled in zip(track.regions, track.filled) if not filled for r in group)
     dropped = {f: kept for f, v in regions.frames.items() if (kept := [r for r in v if id(r) in unsure])}
     sure = RegionSet({f: kept for f, v in regions.frames.items() if (kept := [r for r in v if id(r) not in unsure])},
@@ -269,8 +312,8 @@ def annotate_video(
     samples: dict[int, np.ndarray] = {}
 
     def flush() -> None:
-        for index, found in zip(batch_frames, detector(batch)):
-            regions = detection_regions(found, work_w, work_h, config)
+        for index, frame, found in zip(batch_frames, batch, detector(batch)):
+            regions = mark_flat(detection_regions(found, work_w, work_h, config), frame, config.min_contrast)
             if regions and work_box != video_box:
                 regions = [_move(region, work_box, video_box) for region in regions]
             if regions:
@@ -338,6 +381,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--classes", nargs="*", default=[], help="class names or indices to keep (default: all)")
     parser.add_argument("--exclude-classes", nargs="*", default=[],
                         help="classes whose boxes are cut out of the kept regions (e.g. ANUS_EXPOSED)")
+    parser.add_argument("--doubt-classes", nargs="*", default=[],
+                        help="classes whose boxes make the kept detections mostly inside them doubtful "
+                             "(e.g. FACE_FEMALE FACE_MALE: a mouth taken for genitals)")
+    parser.add_argument("--doubt-inside", type=float, default=AnnotateConfig.doubt_inside,
+                        help="share of a detection's box inside doubt-class boxes that makes it doubtful")
+    parser.add_argument("--min-contrast", type=float, default=AnnotateConfig.min_contrast,
+                        help="regions whose grey levels vary less (standard deviation, 0-255) are doubtful; 0: off")
     parser.add_argument("--conf", type=float, default=DetectorConfig.conf)
     parser.add_argument("--iou", type=float, default=DetectorConfig.iou)
     parser.add_argument("--imgsz", type=int, help="model input size (default: from the model)")
@@ -354,12 +404,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     detector_config = DetectorConfig(
-        conf=args.conf, iou=args.iou, imgsz=args.imgsz, classes=tuple(args.classes), exclude=tuple(args.exclude_classes)
+        conf=args.conf, iou=args.iou, imgsz=args.imgsz, classes=tuple(args.classes), exclude=tuple(args.exclude_classes),
+        doubt=tuple(args.doubt_classes),
     )
     config = AnnotateConfig(
         batch=args.batch, stride=args.stride, grow=args.grow,
         min_track_seconds=args.min_track_seconds, max_gap_seconds=args.max_gap_seconds,
-        min_track_score=args.min_track_score,
+        min_track_score=args.min_track_score, doubt_inside=args.doubt_inside, min_contrast=args.min_contrast,
     )
     videos = find_videos(args.videos)
     if not videos:
@@ -372,7 +423,8 @@ def main(argv: list[str] | None = None) -> int:
 
     detector = YoloOnnx(args.model, detector_config)  # also checks the model and the class lists
     print(f"model {args.model.name}: {detector.task}, input {detector.size}, classes {detector.names}, "
-          f"keeping {detector.kept_classes}, cutting out {detector.excluded_classes}, on {detector.providers[0]}",
+          f"keeping {detector.kept_classes}, cutting out {detector.excluded_classes}, "
+          f"doubting inside {detector.doubt_classes}, on {detector.providers[0]}",
           flush=True)
 
     # Region files are reused only if they were written with the same settings.
@@ -381,7 +433,8 @@ def main(argv: list[str] | None = None) -> int:
         "exclude": detector.excluded_classes, "conf": args.conf, "iou": args.iou, "imgsz": detector.size,
         "stride": config.stride, "grow": config.grow,
         "min_track_seconds": config.min_track_seconds, "max_gap_seconds": config.max_gap_seconds,
-        "min_track_score": config.min_track_score,
+        "min_track_score": config.min_track_score, "doubt": detector.doubt_classes,
+        "doubt_inside": config.doubt_inside, "min_contrast": config.min_contrast,
     }
     settings_path = args.out / SETTINGS_FILE
     try:

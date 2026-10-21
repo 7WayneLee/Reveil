@@ -42,10 +42,11 @@ python -m reveil.annotate --videos sources/ --model detector.onnx --out regions/
 - 分割模型的遮罩變成輪廓多邊形，偵測模型的框變成方框，都會再外擴一點（`--grow`，畫面短邊的比例）。
 - 每格的偵測結果會連成 track：短於 `--min-track-seconds` 的丟掉，`--max-gap-seconds` 以內的漏偵測用前後影格補上。偵測到的場景切換寫進 `cuts`。
 - `--classes` 只保留指定類別（名稱或編號），`--conf` 是分數門檻，`--stride N` 每 N 格偵測一次（中間的影格會補上）。執行時會印出模型的所有類別。
-- `--preview-dir` 每部影片輸出一張預覽圖，綠線是標註；產生配對前先看過。
+- 不可靠的偵測整段丟掉，不打碼：每個區域各自連成 track，分數中位數低於 `--min-track-score` 的（例如被誤判的手、玩具）、或大半影格是「可疑」偵測的。可疑是指框有 `--doubt-inside`（預設 0.7）以上落在 `--doubt-classes` 類別的框裡（例如臉：舌吻的嘴被誤判成生殖器；口交時真正的生殖器和臉重疊通常不到一半），或框裡的灰階標準差低於 `--min-contrast`（預設 8，0–255；例如暗到看不出東西的畫面，打了馬賽克也沒有東西可以還原）。丟掉的區域記在標註檔的 `dropped` 裡。
+- `--preview-dir` 每部影片輸出一張預覽圖，綠線是標註，紅線是丟掉的偵測；產生配對前先看過。
 - 已經有標註檔的影片會跳過，`--overwrite` 重做。標註設定（模型、類別、門檻等）記在輸出資料夾的 `annotate_settings.json`，設定改了就全部重新標註；所以 `--out` 請用自動標註專用的資料夾。
 
-Colab notebook 預設用 [NudeNet](https://github.com/notAI-tech/NudeNet) 的 `640m` 偵測模型（官方 GitHub 的下載現在要登入，notebook 依序改從 Hugging Face 上的副本下載，並檢查下載到的不是登入頁或錯誤頁），只取 `FEMALE_GENITALIA_EXPOSED` 和 `MALE_GENITALIA_EXPOSED` 兩類，並把 `ANUS_EXPOSED` 的框從生殖器的框裡挖掉（`--exclude-classes`）：一般有碼片只遮生殖器，肛門不打碼，假馬賽克也要一樣。也可以改用 [Lada](https://github.com/ladaapp/lada) 的分割模型 `lada_nsfw_detection_model_v1.3`；它只有一類 `nsfw`，會連肛門一起標。每個偵測模型的標註和預覽各放一個資料夾（`regions/<偵測模型>/`、`previews/<偵測模型>/`），換模型就會重新標註。
+Colab notebook 預設用 [NudeNet](https://github.com/notAI-tech/NudeNet) 的 `640m` 偵測模型（官方 GitHub 的下載現在要登入，notebook 依序改從 Hugging Face 上的副本下載，並檢查下載到的不是登入頁或錯誤頁），只取 `FEMALE_GENITALIA_EXPOSED` 和 `MALE_GENITALIA_EXPOSED` 兩類，並把 `ANUS_EXPOSED` 的框從生殖器的框裡挖掉（`--exclude-classes`）：一般有碼片只遮生殖器，肛門不打碼，假馬賽克也要一樣。大半落在 `FACE_FEMALE`、`FACE_MALE` 框裡的偵測算可疑（`--doubt-classes`）。也可以改用 [Lada](https://github.com/ladaapp/lada) 的分割模型 `lada_nsfw_detection_model_v1.3`；它只有一類 `nsfw`，會連肛門一起標，也沒有臉的類別。每個偵測模型的標註和預覽各放一個資料夾（`regions/<偵測模型>/`、`previews/<偵測模型>/`），換模型就會重新標註。
 
 產生配對：
 

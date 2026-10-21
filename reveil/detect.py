@@ -28,6 +28,7 @@ class DetectorConfig:
     imgsz: int | None = None  # model input side; None reads it from the model (else 640)
     classes: tuple[str, ...] = ()  # class names or indices to keep; empty keeps all
     exclude: tuple[str, ...] = ()  # classes whose boxes are cut out of the kept regions
+    doubt: tuple[str, ...] = ()  # classes whose boxes cast doubt on kept detections inside them (faces)
     max_detections: int = 50
 
 
@@ -38,6 +39,7 @@ class FrameDetections:
     classes: np.ndarray  # (n,) class indices
     mask: np.ndarray | None  # (H, W) bool union of the instance masks; None for detect models
     excluded: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))  # (m, 4) boxes of excluded classes
+    doubt: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))  # (k, 4) boxes of doubt classes
 
 
 @dataclass(frozen=True)
@@ -176,8 +178,11 @@ class YoloOnnx:
             )
         self._keep = self._class_indices(config.classes)
         self._exclude = self._class_indices(config.exclude) if config.exclude else np.zeros(0, dtype=np.int64)
+        self._doubt = self._class_indices(config.doubt) if config.doubt else np.zeros(0, dtype=np.int64)
         if np.isin(self._exclude, self._keep).any():
             raise ValueError(f"classes {self.excluded_classes} are both kept and excluded")
+        if np.isin(self._doubt, np.concatenate([self._keep, self._exclude])).any():
+            raise ValueError(f"doubt classes {self.doubt_classes} must be neither kept nor excluded")
 
     def _class_indices(self, classes: tuple[str, ...]) -> np.ndarray:
         if not classes:
@@ -205,6 +210,10 @@ class YoloOnnx:
     def excluded_classes(self) -> list[str]:
         return [self.names[int(index)] for index in self._exclude]
 
+    @property
+    def doubt_classes(self) -> list[str]:
+        return [self.names[int(index)] for index in self._doubt]
+
     def __call__(self, frames: list[np.ndarray]) -> list[FrameDetections]:
         step = self._fixed_batch or len(frames)
         results = []
@@ -220,7 +229,7 @@ class YoloOnnx:
         np.multiply(np.stack(canvases).transpose(0, 3, 1, 2), np.float32(1 / 255), out=batch[:count])
         batch[count:] = 0
         outputs = self.session.run(None, {self._input_name: batch})
-        wanted = np.concatenate([self._keep, self._exclude])
+        wanted = np.concatenate([self._keep, self._exclude, self._doubt])
         results = []
         for i, (frame, box) in enumerate(zip(frames, boxes_in)):
             h, w = frame.shape[:2]
@@ -229,11 +238,12 @@ class YoloOnnx:
                 self.config.conf, self.config.iou, self.config.max_detections,
             )
             kept = np.isin(classes, self._keep)
-            excluded = to_frame_boxes(found[~kept], box, w, h)
+            excluded = to_frame_boxes(found[np.isin(classes, self._exclude)], box, w, h)
+            doubt = to_frame_boxes(found[np.isin(classes, self._doubt)], box, w, h)
             found, scores, classes, coefficients = found[kept], scores[kept], classes[kept], coefficients[kept]
             mask = None
             if self.task == "segment":
                 union = instance_union(coefficients, outputs[1][i].astype(np.float32, copy=False), found, self.size)
                 mask = to_frame_mask(union, box, w, h)
-            results.append(FrameDetections(to_frame_boxes(found, box, w, h), scores, classes, mask, excluded))
+            results.append(FrameDetections(to_frame_boxes(found, box, w, h), scores, classes, mask, excluded, doubt))
         return results
