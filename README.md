@@ -87,7 +87,7 @@ mosaic: {block_fraction: [0.008, 0.015], blur_probability: 0.0}
 - Colab 密鑰 `HF_TOKEN`（先在 Hugging Face 同意 LTX-2.5 的條款）
 - Drive 上的 `reveil/sources/`（原始影片）；`reveil/regions/`（標註）會自動產生，也可以自己放
 
-notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。偵測模型第一次匯出成 ONNX 後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。正式訓練的配對少於 `MIN_SAMPLES`（預設 100）時，notebook 會停下來不訓練。
+notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。偵測模型第一次匯出成 ONNX 後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。每部影片最多取 `MAX_WINDOWS_PER_VIDEO` 組配對（預設 100，隨機挑），讓資料平均來自不同影片；正式訓練的配對少於 `MIN_SAMPLES`（預設 100）時，notebook 會停下來不訓練。
 
 訓練設定在 `configs/ic_lora_512.yaml`：LoRA rank 32、學習率 2e-4、3000 步、batch 1、bf16、gradient checkpointing；只有 reference 條件，沒有 first_frame 條件。
 
