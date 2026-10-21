@@ -1,0 +1,215 @@
+"""Ultralytics YOLO detect / segment models exported to ONNX, run with onnxruntime.
+
+Only the exported ONNX file is used, not the ultralytics package: export it once with
+``yolo export model=<weights>.pt format=onnx dynamic=True``. Frames are RGB uint8
+(H, W, 3); each is letterboxed into the square model input the way ultralytics does
+(centred, grey 114 padding) and the results are mapped back to frame pixels. A segment
+model's instance masks are cropped to their boxes and merged into one mask per frame.
+"""
+
+from __future__ import annotations
+
+import ast
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+PAD_VALUE = 114
+MASK_THRESHOLD = 0.5
+DEFAULT_SIZE = 640
+
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    conf: float = 0.3  # minimum class score
+    iou: float = 0.5  # NMS overlap
+    imgsz: int | None = None  # model input side; None reads it from the model (else 640)
+    classes: tuple[str, ...] = ()  # class names or indices to keep; empty keeps all
+    max_detections: int = 50
+
+
+@dataclass
+class FrameDetections:
+    boxes: np.ndarray  # (n, 4) x0, y0, x1, y1 in frame pixels
+    scores: np.ndarray  # (n,)
+    classes: np.ndarray  # (n,) class indices
+    mask: np.ndarray | None  # (H, W) bool union of the instance masks; None for detect models
+
+
+@dataclass(frozen=True)
+class Letterbox:
+    scale: float
+    left: int
+    top: int
+    width: int  # size of the scaled frame inside the input
+    height: int
+
+
+def letterbox(frame: np.ndarray, size: int) -> tuple[np.ndarray, Letterbox]:
+    h, w = frame.shape[:2]
+    scale = min(size / h, size / w)
+    width, height = max(1, round(w * scale)), max(1, round(h * scale))
+    left, top = (size - width) // 2, (size - height) // 2
+    canvas = np.full((size, size, 3), PAD_VALUE, dtype=np.uint8)
+    canvas[top : top + height, left : left + width] = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+    return canvas, Letterbox(scale, left, top, width, height)
+
+
+def nms(boxes: np.ndarray, scores: np.ndarray, iou: float) -> np.ndarray:
+    """Indices of the boxes kept by greedy non-maximum suppression, best first."""
+    order = np.argsort(-scores, kind="stable")
+    areas = (boxes[:, 2] - boxes[:, 0]).clip(0) * (boxes[:, 3] - boxes[:, 1]).clip(0)
+    keep = []
+    while order.size:
+        best, rest = order[0], order[1:]
+        keep.append(best)
+        w = (np.minimum(boxes[best, 2], boxes[rest, 2]) - np.maximum(boxes[best, 0], boxes[rest, 0])).clip(0)
+        h = (np.minimum(boxes[best, 3], boxes[rest, 3]) - np.maximum(boxes[best, 1], boxes[rest, 1])).clip(0)
+        inter = w * h
+        union = areas[best] + areas[rest] - inter
+        order = rest[inter <= iou * np.maximum(union, 1e-9)]
+    return np.asarray(keep, dtype=np.int64)
+
+
+def decode(
+    pred: np.ndarray, num_classes: int, keep: np.ndarray, conf: float, iou: float, max_detections: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One image's raw output (4 + classes + mask coefficients, anchors) -> boxes (x0, y0,
+    x1, y1 in input pixels), scores, class indices and mask coefficients of the detections
+    of the ``keep`` classes, after NMS."""
+    pred = pred.T
+    class_scores = pred[:, 4 : 4 + num_classes][:, keep]
+    scores = class_scores.max(axis=1)
+    chosen = scores >= conf
+    pred, class_scores, scores = pred[chosen], class_scores[chosen], scores[chosen]
+    cx, cy, w, h = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+    boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
+    order = nms(boxes, scores, iou)[:max_detections]
+    return boxes[order], scores[order], keep[class_scores[order].argmax(axis=1)], pred[order, 4 + num_classes :]
+
+
+def instance_union(coefficients: np.ndarray, protos: np.ndarray, boxes: np.ndarray, size: int) -> np.ndarray:
+    """Merged instance masks (sigmoid of coefficients x prototypes, each cropped to its box)
+    as float probabilities at the input resolution."""
+    count, height, width = protos.shape
+    union = np.zeros((height, width), dtype=np.float32)
+    if len(coefficients):
+        masks = 1 / (1 + np.exp(-(coefficients @ protos.reshape(count, -1))))
+        masks = masks.reshape(-1, height, width)
+        ys = (np.arange(height) + 0.5)[:, None] * size / height
+        xs = (np.arange(width) + 0.5)[None, :] * size / width
+        for mask, (x0, y0, x1, y1) in zip(masks, boxes):
+            inside = (xs >= x0) & (xs < x1) & (ys >= y0) & (ys < y1)
+            np.maximum(union, mask * inside, out=union)
+    return cv2.resize(union, (size, size), interpolation=cv2.INTER_LINEAR)
+
+
+def to_frame_mask(union: np.ndarray, box: Letterbox, frame_w: int, frame_h: int) -> np.ndarray:
+    content = union[box.top : box.top + box.height, box.left : box.left + box.width]
+    return cv2.resize(content, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR) > MASK_THRESHOLD
+
+
+def to_frame_boxes(boxes: np.ndarray, box: Letterbox, frame_w: int, frame_h: int) -> np.ndarray:
+    out = boxes.copy()
+    out[:, [0, 2]] = ((out[:, [0, 2]] - box.left) / box.scale).clip(0, frame_w)
+    out[:, [1, 3]] = ((out[:, [1, 3]] - box.top) / box.scale).clip(0, frame_h)
+    return out
+
+
+def _literal(text: str | None):
+    try:
+        return ast.literal_eval(text) if text else None
+    except (ValueError, SyntaxError):
+        return None
+
+
+class YoloOnnx:
+    """Runs an exported YOLO model on batches of frames; CUDA when onnxruntime has it."""
+
+    def __init__(self, path: str | Path, config: DetectorConfig = DetectorConfig(), providers: list[str] | None = None):
+        import onnxruntime as ort
+
+        if hasattr(ort, "preload_dlls"):
+            try:  # CUDA / cuDNN from the nvidia pip packages (onnxruntime-gpu on Colab)
+                ort.preload_dlls()
+            except Exception:  # noqa: BLE001 - CPU still works
+                pass
+        if providers is None:
+            available = ort.get_available_providers()
+            providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
+        self.session = ort.InferenceSession(str(path), providers=providers)
+        self.config = config
+        metadata = self.session.get_modelmeta().custom_metadata_map
+        model_input = self.session.get_inputs()[0]
+        self._input_name = model_input.name
+        self._input_dtype = np.float16 if "float16" in model_input.type else np.float32
+        self._fixed_batch = model_input.shape[0] if isinstance(model_input.shape[0], int) else None
+        outputs = self.session.get_outputs()
+        self.task = metadata.get("task") or ("segment" if len(outputs) > 1 else "detect")
+        fixed_size = model_input.shape[2] if isinstance(model_input.shape[2], int) else None
+        size_meta = _literal(metadata.get("imgsz"))
+        self.size = config.imgsz or fixed_size or (size_meta[0] if size_meta else DEFAULT_SIZE)
+        channels = outputs[0].shape[1]
+        names = _literal(metadata.get("names"))
+        if not isinstance(names, dict) and isinstance(channels, int):
+            names = {i: str(i) for i in range(channels - 4 - (32 if self.task == "segment" else 0))}
+        self.names: dict[int, str] = {int(k): str(v) for k, v in (names or {}).items()}
+        expected = 4 + len(self.names) + (32 if self.task == "segment" else 0)
+        if isinstance(channels, int) and channels != expected:
+            raise ValueError(
+                f"{path}: output {outputs[0].shape} is not a raw YOLO {self.task} output with {expected} channels "
+                "(4 box + classes + mask coefficients); export it again with nms=False"
+            )
+        self._keep = self._class_indices(config.classes)
+
+    def _class_indices(self, classes: tuple[str, ...]) -> np.ndarray:
+        if not classes:
+            return np.asarray(sorted(self.names), dtype=np.int64)
+        by_name = {name: index for index, name in self.names.items()}
+        indices = []
+        for item in classes:
+            if item in by_name:
+                indices.append(by_name[item])
+            elif item.isdigit() and int(item) in self.names:
+                indices.append(int(item))
+            else:
+                raise ValueError(f"unknown class {item!r}; the model has {self.names}")
+        return np.asarray(indices, dtype=np.int64)
+
+    @property
+    def providers(self) -> list[str]:
+        return self.session.get_providers()
+
+    @property
+    def kept_classes(self) -> list[str]:
+        return [self.names[int(index)] for index in self._keep]
+
+    def __call__(self, frames: list[np.ndarray]) -> list[FrameDetections]:
+        step = self._fixed_batch or len(frames)
+        results = []
+        for start in range(0, len(frames), step):
+            results.extend(self._run(frames[start : start + step]))
+        return results
+
+    def _run(self, frames: list[np.ndarray]) -> list[FrameDetections]:
+        canvases, boxes_in = zip(*(letterbox(frame, self.size) for frame in frames))
+        batch = np.stack(canvases).transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        if self._fixed_batch and len(frames) < self._fixed_batch:
+            pad = np.zeros((self._fixed_batch - len(frames), *batch.shape[1:]), dtype=batch.dtype)
+            batch = np.concatenate([batch, pad])
+        outputs = self.session.run(None, {self._input_name: batch.astype(self._input_dtype)})
+        results = []
+        for i, (frame, box) in enumerate(zip(frames, boxes_in)):
+            h, w = frame.shape[:2]
+            found, scores, classes, coefficients = decode(
+                outputs[0][i].astype(np.float32), len(self.names), self._keep,
+                self.config.conf, self.config.iou, self.config.max_detections,
+            )
+            mask = None
+            if self.task == "segment":
+                union = instance_union(coefficients, outputs[1][i].astype(np.float32), found, self.size)
+                mask = to_frame_mask(union, box, w, h)
+            results.append(FrameDetections(to_frame_boxes(found, box, w, h), scores, classes, mask))
+        return results

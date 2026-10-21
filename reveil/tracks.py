@@ -17,6 +17,7 @@ class Track:
     start: int  # first frame index
     boxes: list[Box]  # union box of the track's regions on each frame from ``start``
     regions: list[list[Region]]  # the regions on each frame
+    filled: list[bool] = field(default_factory=list)  # per frame: a gap filled from a neighbour
 
     @property
     def stop(self) -> int:
@@ -34,18 +35,20 @@ class _Building:
 
     def finish(self) -> Track:
         known = sorted(self.frames)
-        boxes, regions = [], []
+        boxes, regions, filled = [], [], []
         for left, right in zip(known, known[1:] + [known[-1] + 1]):
             box, group = self.frames[left]
             boxes.append(box)
             regions.append(group)
+            filled.append(False)
             if right - left > 1:
                 next_box, next_group = self.frames[right]
                 for frame in range(left + 1, right):
                     t = (frame - left) / (right - left)
                     boxes.append(tuple(a + (b - a) * t for a, b in zip(box, next_box)))
                     regions.append(group if t <= 0.5 else next_group)
-        return Track(known[0], boxes, regions)
+                    filled.append(True)
+        return Track(known[0], boxes, regions, filled)
 
 
 def box_iou(a: Box, b: Box) -> float:

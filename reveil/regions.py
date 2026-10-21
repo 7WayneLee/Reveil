@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,8 +53,14 @@ class Region:
 
     def to_json(self) -> dict:
         if self.polygon is not None:
-            return {"polygon": np.round(self.polygon, 2).tolist()}
-        return {"box": [round(v, 2) for v in self.box]}
+            return {"polygon": [[_compact(x), _compact(y)] for x, y in self.polygon.tolist()]}
+        return {"box": [_compact(v) for v in self.box]}
+
+
+def _compact(value: float) -> float | int:
+    """Whole pixels as ints, the rest to 0.1 px, to keep long region files small."""
+    value = round(float(value), 1)
+    return int(value) if value.is_integer() else value
 
 
 @dataclass
@@ -82,7 +89,10 @@ def save_regions(regions: RegionSet, path: str | Path) -> None:
         "frames": {str(index): [r.to_json() for r in items] for index, items in sorted(regions.frames.items())},
         "cuts": sorted(regions.cuts),
     }
-    Path(path).write_text(json.dumps(data), encoding="utf-8")
+    path = Path(path)
+    partial = path.with_name(path.name + ".part")
+    partial.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    os.replace(partial, path)
 
 
 def union_box(regions: Sequence[Region]) -> Box:
