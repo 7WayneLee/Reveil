@@ -46,10 +46,21 @@ def load_config(path: Path | None) -> PairConfig:
 
 
 def find_videos(paths: list[Path]) -> list[Path]:
+    """The video files among ``paths``, searching directories recursively. Symlinked
+    directories are followed, each real directory once: Google Drive shortcuts are
+    symlinks in Colab."""
     videos = []
     for path in paths:
         if path.is_dir():
-            videos.extend(p for p in sorted(path.rglob("*")) if p.suffix.lower() in VIDEO_SUFFIXES)
+            found, seen = [], set()
+            for root, dirs, files in os.walk(path, followlinks=True):
+                real = os.path.realpath(root)
+                if real in seen:
+                    dirs.clear()
+                    continue
+                seen.add(real)
+                found.extend(Path(root, name) for name in files if Path(name).suffix.lower() in VIDEO_SUFFIXES)
+            videos.extend(sorted(found))
         elif path.is_file():
             videos.append(path)
         else:

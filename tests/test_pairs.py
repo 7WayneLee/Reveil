@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from reveil.camera import CameraConfig
-from reveil.make_pairs import load_config, main
+from reveil.make_pairs import find_videos, load_config, main
 from reveil.mosaic import MosaicConfig
 from reveil.pairs import PairConfig, build_video_pairs, rebuild_dataset
 from reveil.regions import Region, RegionSet
@@ -96,6 +96,21 @@ def test_cli_explains_missing_videos_and_region_files(make_video, tmp_path):
     (tmp_path / "regions").mkdir()
     with pytest.raises(SystemExit, match=r"none of the 1 videos has a region file .*clip\.json"):
         main(["--videos", str(video.parent), "--regions", str(tmp_path / "regions"), "--out", str(tmp_path / "out")])
+
+
+def test_find_videos_follows_symlinked_folders_once(tmp_path):
+    shared = tmp_path / "shared" / "FC2"  # a Drive shortcut's target
+    (shared / "unknow 1" / "FC2-PPV-1").mkdir(parents=True)
+    (shared / "unknow 1" / "FC2-PPV-1" / "a-1.MP4").touch()
+    (shared / "b.mkv").touch()
+    (shared / "notes.txt").touch()
+    (shared / "loop").symlink_to(shared, target_is_directory=True)
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    (sources / "FC2").symlink_to(shared, target_is_directory=True)
+    found = find_videos([sources])
+    assert [p.relative_to(sources).as_posix() for p in found] == ["FC2/b.mkv", "FC2/unknow 1/FC2-PPV-1/a-1.MP4"]
+    assert find_videos([sources / "FC2"]) == [sources / "FC2" / "b.mkv", sources / "FC2/unknow 1/FC2-PPV-1/a-1.MP4"]
 
 
 def test_config_rejects_unknown_fields(tmp_path):
