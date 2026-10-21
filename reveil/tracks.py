@@ -84,8 +84,9 @@ def group_regions(regions: list[Region]) -> list[list[Region]]:
     return list(groups.values())
 
 
-def build_tracks(regions: RegionSet, *, max_gap: int = 3, link_iou: float = 0.1) -> list[Track]:
-    """Every region track of ``regions``, ordered by start frame."""
+def build_tracks(regions: RegionSet, *, max_gap: int = 3, link_iou: float = 0.1, group: bool = True) -> list[Track]:
+    """Every region track of ``regions``, ordered by start frame; with ``group=False`` each
+    region is followed on its own, even where it overlaps others."""
     if not regions.frames:
         return []
     done: list[_Building] = []
@@ -96,7 +97,8 @@ def build_tracks(regions: RegionSet, *, max_gap: int = 3, link_iou: float = 0.1)
             live = []
         done.extend(t for t in live if frame - t.last - 1 > max_gap)
         live = [t for t in live if frame - t.last - 1 <= max_gap]
-        groups = group_regions(regions.frames.get(frame, []))
+        found = regions.frames.get(frame, [])
+        groups = group_regions(found) if group else [[region] for region in found]
         if not groups:
             continue
         boxes = [union_box(group) for group in groups]
@@ -118,10 +120,10 @@ def build_tracks(regions: RegionSet, *, max_gap: int = 3, link_iou: float = 0.1)
             live[ti].add(frame, boxes[gi], groups[gi])
             used_tracks.add(ti)
             used_groups.add(gi)
-        for gi, (box, group) in enumerate(zip(boxes, groups)):
+        for gi, (box, members) in enumerate(zip(boxes, groups)):
             if gi not in used_groups:
                 track = _Building(frame)
-                track.add(frame, box, group)
+                track.add(frame, box, members)
                 live.append(track)
     done.extend(live)
     return sorted((t.finish() for t in done), key=lambda track: track.start)

@@ -36,7 +36,7 @@ from reveil.video import probe, read_frames
 
 PREVIEW_WIDTH = 480
 SETTINGS_FILE = "annotate_settings.json"
-SETTINGS_VERSION = 3  # raised when old region files must be redone (the annotation changed, or stray runs wrote some)
+SETTINGS_VERSION = 4  # raised when old region files must be redone (the annotation changed, or stray runs wrote some)
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,9 @@ def _paint(mask: np.ndarray, box: Box, value: bool) -> None:
 
 def detection_regions(detections: FrameDetections, frame_w: int, frame_h: int, config: AnnotateConfig) -> list[Region]:
     """Regions of the kept detections, grown a little, each with the best score of the
-    detections it came from; the boxes of excluded classes (grown as much) are cut out."""
+    detections it came from. The boxes of excluded classes (grown as much) are cut out, but
+    never from inside a kept detection's own box: the genitals stay covered even where the
+    anus box reaches into them."""
     grow_px = round(config.grow * min(frame_w, frame_h))
     min_area_px = config.min_area * frame_w * frame_h
     excluded = [box for box in (_grow(b, grow_px, frame_w, frame_h) for b in detections.excluded.tolist()) if box]
@@ -100,14 +102,20 @@ def detection_regions(detections: FrameDetections, frame_w: int, frame_h: int, c
     if detections.mask is None and not any(_overlap(box, cut) for box, _ in scored for cut in excluded):
         return [Region(box, score=score) for box, score in scored
                 if (box[2] - box[0]) * (box[3] - box[1]) >= min_area_px]
+    core = np.zeros((frame_h, frame_w), dtype=bool)
+    for box in (clip_box(tuple(b), frame_w, frame_h) for b in detections.boxes.tolist()):
+        if box is not None:
+            _paint(core, box, True)
     if detections.mask is not None:
         mask, grow = (detections.mask.copy() if excluded else detections.mask), grow_px
+        core &= detections.mask
     else:
         mask, grow = np.zeros((frame_h, frame_w), dtype=bool), 0
         for box, _ in scored:
             _paint(mask, box, True)
     for box in excluded:
         _paint(mask, box, False)
+    mask |= core
     regions = mask_regions(mask, grow_px=grow, min_area_px=min_area_px, simplify=config.simplify)
     return [_with_score(region, scored) for region in regions]
 
@@ -170,22 +178,29 @@ def _track_score(track) -> float | None:
 def smooth_tracks(
     regions: RegionSet, fps: float, config: AnnotateConfig
 ) -> tuple[RegionSet, dict[int, list[Region]]]:
-    """Per-frame detections as tracks: short tracks dropped, gaps filled. Tracks the detector
-    was unsure of (median score under ``min_track_score``) come back separately, as dropped."""
+    """Per-frame detections as tracks: short tracks dropped, gaps filled. Regions whose own
+    track the detector was unsure of (median score under ``min_track_score``) come back
+    separately, as dropped: each region is followed on its own for this, so a doubtful one
+    beside a sure one (a toy against the genitals) still goes."""
     max_gap = max(config.stride - 1, round(config.max_gap_seconds * fps))
     min_frames = round(config.min_track_seconds * fps)
+    unsure: set[int] = set()
+    for track in build_tracks(regions, max_gap=max_gap, group=False):
+        score = _track_score(track)
+        if score is not None and score < config.min_track_score:
+            unsure.update(id(r) for group, filled in zip(track.regions, track.filled) if not filled for r in group)
+    dropped = {f: kept for f, v in regions.frames.items() if (kept := [r for r in v if id(r) in unsure])}
+    sure = RegionSet({f: kept for f, v in regions.frames.items() if (kept := [r for r in v if id(r) not in unsure])},
+                     regions.cuts)
     frames: dict[int, list[Region]] = {}
-    dropped: dict[int, list[Region]] = {}
-    for track in build_tracks(regions, max_gap=max_gap):
+    for track in build_tracks(sure, max_gap=max_gap):
         if len(track.boxes) < min_frames:
             continue
-        score = _track_score(track)
-        target = dropped if score is not None and score < config.min_track_score else frames
         for offset, (box, group, filled) in enumerate(zip(track.boxes, track.regions, track.filled)):
             if filled:
                 source = union_box(group)
                 group = [_move(region, source, box) for region in group]
-            target.setdefault(track.start + offset, []).extend(group)
+            frames.setdefault(track.start + offset, []).extend(group)
     return RegionSet(frames, regions.cuts), dropped
 
 

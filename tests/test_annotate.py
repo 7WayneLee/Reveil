@@ -66,11 +66,14 @@ def test_excluded_boxes_are_cut_out_of_the_kept_regions():
     found = FrameDetections(np.array([[20.0, 20, 60, 60]]), np.array([0.9]), np.array([0]), None,
                             excluded=np.array([[40.0, 40, 80, 80]]))
     (region,) = detection_regions(found, 100, 100, AnnotateConfig(grow=0.0))
-    assert region.polygon is not None and region.box == pytest.approx((20, 20, 59, 59), abs=1)
+    assert region.box == pytest.approx((20, 20, 59, 59), abs=1)
     from reveil.regions import rasterize
 
     mask = rasterize([region], (0, 0), (100, 100), ellipse=False)
-    assert mask[25, 25] and mask[25, 55] and not mask[50, 50]  # the corner inside the excluded box is gone
+    assert mask[25, 25] and mask[55, 55] and not mask[65, 65]  # the detected box stays whole; only the rest is cut
+    grown = detection_regions(found, 100, 100, AnnotateConfig(grow=0.1))  # 10 px of growth
+    mask = rasterize(grown, (0, 0), (100, 100), ellipse=False)
+    assert mask[15, 15] and mask[59, 59] and not mask[62, 50] and mask[62, 30]  # no growth into the excluded box
     apart = FrameDetections(found.boxes, found.scores, found.classes, None, excluded=np.array([[70.0, 70, 90, 90]]))
     assert [r.box for r in detection_regions(apart, 100, 100, AnnotateConfig(grow=0.0))] == [(20, 20, 60, 60)]
 
@@ -91,6 +94,10 @@ def test_tracks_the_detector_was_unsure_of_are_dropped():
     kept, dropped = smooth_tracks(RegionSet(frames), 30.0, AnnotateConfig())
     assert all(len(v) == 1 and v[0].box[0] < 100 for v in kept.frames.values()) and len(kept.frames) == 60
     assert sorted(dropped) == list(range(60)) and all(v[0].box[0] == 200 for v in dropped.values())
+    # a doubtful region overlapping a sure one is still dropped
+    frames = {f: [Region((100, 100, 200, 200), score=0.9), Region((180, 80, 400, 300), score=0.3)] for f in range(60)}
+    kept, dropped = smooth_tracks(RegionSet(frames), 30.0, AnnotateConfig())
+    assert all([r.box for r in v] == [(100, 100, 200, 200)] for v in kept.frames.values()) and len(dropped) == 60
 
 
 def test_cut_detector_flags_hard_cuts_only():
