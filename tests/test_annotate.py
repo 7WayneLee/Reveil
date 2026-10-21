@@ -62,6 +62,19 @@ def test_detect_model_boxes_are_grown_and_clipped():
     assert region.box == (0, 5, 35, 45)
 
 
+def test_excluded_boxes_are_cut_out_of_the_kept_regions():
+    found = FrameDetections(np.array([[20.0, 20, 60, 60]]), np.array([0.9]), np.array([0]), None,
+                            excluded=np.array([[40.0, 40, 80, 80]]))
+    (region,) = detection_regions(found, 100, 100, AnnotateConfig(grow=0.0))
+    assert region.polygon is not None and region.box == pytest.approx((20, 20, 59, 59), abs=1)
+    from reveil.regions import rasterize
+
+    mask = rasterize([region], (0, 0), (100, 100), ellipse=False)
+    assert mask[25, 25] and mask[25, 55] and not mask[50, 50]  # the corner inside the excluded box is gone
+    apart = FrameDetections(found.boxes, found.scores, found.classes, None, excluded=np.array([[70.0, 70, 90, 90]]))
+    assert [r.box for r in detection_regions(apart, 100, 100, AnnotateConfig(grow=0.0))] == [(20, 20, 60, 60)]
+
+
 def test_cut_detector_flags_hard_cuts_only():
     frames = list(square_frames(20, cut_at=10))
     detect = CutDetector(30.0)
@@ -135,3 +148,4 @@ def test_cli_with_an_onnx_model_skips_finished_videos(tmp_path):
     assert (tmp_path / "previews" / "a.jpg").is_file()
     stamp = (out / "a.json").stat().st_mtime_ns
     assert main(args) == 0 and (out / "a.json").stat().st_mtime_ns == stamp
+    assert main([*args, "--conf", "0.5"]) == 0 and (out / "a.json").stat().st_mtime_ns != stamp  # new settings

@@ -33,6 +33,16 @@ def test_decode_filters_scores_and_classes():
     assert sorted(both.tolist()) == [0, 1]
 
 
+def test_decode_drops_anchors_whose_best_class_is_unwanted():
+    pred = np.zeros((4 + 2, 2), np.float32)
+    pred[:, 0] = [10, 10, 4, 4, 0.4, 0.7]  # more likely class 1, though class 0 is above the threshold
+    pred[:, 1] = [11, 10, 4, 4, 0.6, 0.0]  # overlaps the first
+    boxes, _, classes, _ = decode(pred, 2, np.array([0]), 0.3, 0.5, 10)
+    np.testing.assert_allclose(boxes, [[9, 8, 13, 12]])
+    _, _, both, _ = decode(pred, 2, np.array([0, 1]), 0.3, 0.5, 10)
+    assert sorted(both.tolist()) == [0, 1], "NMS runs per class"
+
+
 def test_instance_masks_are_cropped_to_their_boxes():
     protos = np.full((1, 16, 16), 10.0, np.float32)  # the prototype covers everything
     union = instance_union(np.array([[1.0]], np.float32), protos, np.array([[16, 16, 32, 32]], float), 64)
@@ -76,6 +86,19 @@ def test_end_to_end_exports_are_refused(tmp_path):
     onnx.save(model, str(path))
     with pytest.raises(ValueError, match="nms=False"):
         YoloOnnx(path)
+
+
+def test_excluded_classes_come_back_as_separate_boxes(tmp_path):
+    from reveil.detect import YoloOnnx
+
+    path = write_yolo_onnx(tmp_path / "det.onnx", task="detect", names=("genitalia", "anus", "face"))
+    detector = YoloOnnx(path, DetectorConfig(classes=("genitalia",), exclude=("anus",)))
+    assert detector.kept_classes == ["genitalia"] and detector.excluded_classes == ["anus"]
+    found = detector([np.zeros((96, 128, 3), np.uint8)])[0]
+    np.testing.assert_allclose(found.boxes, [[48, 32, 80, 64]], atol=0.01)
+    np.testing.assert_allclose(found.excluded, [[92, 76, 108, 92]], atol=0.01)
+    with pytest.raises(ValueError, match="both kept and excluded"):
+        YoloOnnx(path, DetectorConfig(classes=("genitalia", "anus"), exclude=("anus",)))
 
 
 def test_detect_model_and_unknown_classes(tmp_path):

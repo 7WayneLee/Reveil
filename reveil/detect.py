@@ -10,7 +10,7 @@ model's instance masks are cropped to their boxes and merged into one mask per f
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -27,6 +27,7 @@ class DetectorConfig:
     iou: float = 0.5  # NMS overlap
     imgsz: int | None = None  # model input side; None reads it from the model (else 640)
     classes: tuple[str, ...] = ()  # class names or indices to keep; empty keeps all
+    exclude: tuple[str, ...] = ()  # classes whose boxes are cut out of the kept regions
     max_detections: int = 50
 
 
@@ -36,6 +37,7 @@ class FrameDetections:
     scores: np.ndarray  # (n,)
     classes: np.ndarray  # (n,) class indices
     mask: np.ndarray | None  # (H, W) bool union of the instance masks; None for detect models
+    excluded: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))  # (m, 4) boxes of excluded classes
 
 
 @dataclass(frozen=True)
@@ -80,16 +82,20 @@ def decode(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """One image's raw output (4 + classes + mask coefficients, anchors) -> boxes (x0, y0,
     x1, y1 in input pixels), scores, class indices and mask coefficients of the detections
-    of the ``keep`` classes, after NMS."""
+    whose best class is one of ``keep``, after per-class NMS. As in ultralytics, each anchor
+    takes its best class first: one that is most likely an unwanted class is dropped even
+    when a wanted class also scores above ``conf``."""
     pred = pred.T
-    class_scores = pred[:, 4 : 4 + num_classes][:, keep]
-    scores = class_scores.max(axis=1)
-    chosen = scores >= conf
-    pred, class_scores, scores = pred[chosen], class_scores[chosen], scores[chosen]
+    class_scores = pred[:, 4 : 4 + num_classes]
+    classes = class_scores.argmax(axis=1)
+    scores = class_scores[np.arange(len(pred)), classes]
+    chosen = (scores >= conf) & np.isin(classes, keep)
+    pred, classes, scores = pred[chosen], classes[chosen], scores[chosen]
     cx, cy, w, h = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
     boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
-    order = nms(boxes, scores, iou)[:max_detections]
-    return boxes[order], scores[order], keep[class_scores[order].argmax(axis=1)], pred[order, 4 + num_classes :]
+    apart = classes[:, None] * (boxes.max(initial=0) + 1)  # shifts each class away, so NMS runs per class
+    order = nms(boxes + apart, scores, iou)[:max_detections]
+    return boxes[order], scores[order], classes[order], pred[order, 4 + num_classes :]
 
 
 def instance_union(coefficients: np.ndarray, protos: np.ndarray, boxes: np.ndarray, size: int) -> np.ndarray:
@@ -167,6 +173,9 @@ class YoloOnnx:
                 "(4 box + classes + mask coefficients); export it again with nms=False"
             )
         self._keep = self._class_indices(config.classes)
+        self._exclude = self._class_indices(config.exclude) if config.exclude else np.zeros(0, dtype=np.int64)
+        if np.isin(self._exclude, self._keep).any():
+            raise ValueError(f"classes {self.excluded_classes} are both kept and excluded")
 
     def _class_indices(self, classes: tuple[str, ...]) -> np.ndarray:
         if not classes:
@@ -190,6 +199,10 @@ class YoloOnnx:
     def kept_classes(self) -> list[str]:
         return [self.names[int(index)] for index in self._keep]
 
+    @property
+    def excluded_classes(self) -> list[str]:
+        return [self.names[int(index)] for index in self._exclude]
+
     def __call__(self, frames: list[np.ndarray]) -> list[FrameDetections]:
         step = self._fixed_batch or len(frames)
         results = []
@@ -205,16 +218,20 @@ class YoloOnnx:
         np.multiply(np.stack(canvases).transpose(0, 3, 1, 2), np.float32(1 / 255), out=batch[:count])
         batch[count:] = 0
         outputs = self.session.run(None, {self._input_name: batch})
+        wanted = np.concatenate([self._keep, self._exclude])
         results = []
         for i, (frame, box) in enumerate(zip(frames, boxes_in)):
             h, w = frame.shape[:2]
             found, scores, classes, coefficients = decode(
-                outputs[0][i].astype(np.float32, copy=False), len(self.names), self._keep,
+                outputs[0][i].astype(np.float32, copy=False), len(self.names), wanted,
                 self.config.conf, self.config.iou, self.config.max_detections,
             )
+            kept = np.isin(classes, self._keep)
+            excluded = to_frame_boxes(found[~kept], box, w, h)
+            found, scores, classes, coefficients = found[kept], scores[kept], classes[kept], coefficients[kept]
             mask = None
             if self.task == "segment":
                 union = instance_union(coefficients, outputs[1][i].astype(np.float32, copy=False), found, self.size)
                 mask = to_frame_mask(union, box, w, h)
-            results.append(FrameDetections(to_frame_boxes(found, box, w, h), scores, classes, mask))
+            results.append(FrameDetections(to_frame_boxes(found, box, w, h), scores, classes, mask, excluded))
         return results

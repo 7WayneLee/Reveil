@@ -4,16 +4,20 @@
 
 Every frame (or every ``stride``-th) goes through a YOLO detect or segment model
 (``reveil.detect``): a segment model's mask becomes outline polygons, a detect model's
-boxes become box regions, both grown a little. Regions are linked into tracks; tracks
+boxes become box regions, both grown a little. Boxes of excluded classes (say the anus,
+which releases leave uncensored) are cut out of them. Regions are linked into tracks; tracks
 shorter than ``min_track_seconds`` are dropped and gaps up to ``max_gap_seconds`` are
 filled by moving the nearer frame's regions along the interpolated box. Scene cuts found
 from frame differences go into the file too, so no track or training window spans one.
-Videos that already have a region file are skipped, so an interrupted run resumes.
+Videos that already have a region file are skipped, so an interrupted run resumes, as long
+as the settings recorded next to the region files are unchanged; otherwise every video is
+annotated again.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -29,6 +33,8 @@ from reveil.tracks import build_tracks
 from reveil.video import probe, read_frames
 
 PREVIEW_WIDTH = 480
+SETTINGS_FILE = "annotate_settings.json"
+SETTINGS_VERSION = 2  # raised when the annotation itself changes, so old region files are redone
 
 
 @dataclass(frozen=True)
@@ -65,17 +71,44 @@ def mask_regions(mask: np.ndarray, *, grow_px: int, min_area_px: float, simplify
     return regions
 
 
+def _grown_boxes(boxes: np.ndarray, grow_px: int, frame_w: int, frame_h: int) -> list[Box]:
+    grown = (clip_box((x0 - grow_px, y0 - grow_px, x1 + grow_px, y1 + grow_px), frame_w, frame_h)
+             for x0, y0, x1, y1 in boxes.tolist())
+    return [box for box in grown if box is not None]
+
+
+def _overlap(a: Box, b: Box) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _paint(mask: np.ndarray, box: Box, value: bool) -> None:
+    x0, y0, x1, y1 = box
+    mask[int(y0) : int(np.ceil(y1)), int(x0) : int(np.ceil(x1))] = value
+
+
 def detection_regions(detections: FrameDetections, frame_w: int, frame_h: int, config: AnnotateConfig) -> list[Region]:
+    """Regions of the kept detections, grown a little; the boxes of excluded classes (grown
+    as much) are cut out of them."""
     grow_px = round(config.grow * min(frame_w, frame_h))
     min_area_px = config.min_area * frame_w * frame_h
+    excluded = _grown_boxes(detections.excluded, grow_px, frame_w, frame_h)
     if detections.mask is not None:
-        return mask_regions(detections.mask, grow_px=grow_px, min_area_px=min_area_px, simplify=config.simplify)
-    regions = []
-    for x0, y0, x1, y1 in detections.boxes.tolist():
-        box = clip_box((x0 - grow_px, y0 - grow_px, x1 + grow_px, y1 + grow_px), frame_w, frame_h)
-        if box is not None and (box[2] - box[0]) * (box[3] - box[1]) >= min_area_px:
-            regions.append(Region(box))
-    return regions
+        mask = detections.mask
+        if excluded:
+            mask = mask.copy()
+            for box in excluded:
+                _paint(mask, box, False)
+        return mask_regions(mask, grow_px=grow_px, min_area_px=min_area_px, simplify=config.simplify)
+    boxes = [box for box in _grown_boxes(detections.boxes, grow_px, frame_w, frame_h)
+             if (box[2] - box[0]) * (box[3] - box[1]) >= min_area_px]
+    if not any(_overlap(box, cut) for box in boxes for cut in excluded):
+        return [Region(box) for box in boxes]
+    mask = np.zeros((frame_h, frame_w), dtype=bool)
+    for box in boxes:
+        _paint(mask, box, True)
+    for box in excluded:
+        _paint(mask, box, False)
+    return mask_regions(mask, grow_px=0, min_area_px=min_area_px, simplify=config.simplify)
 
 
 class CutDetector:
@@ -256,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True, help="directory for the <video name>.json region files")
     parser.add_argument("--model", type=Path, required=True, help="YOLO detect/segment model exported to ONNX")
     parser.add_argument("--classes", nargs="*", default=[], help="class names or indices to keep (default: all)")
+    parser.add_argument("--exclude-classes", nargs="*", default=[],
+                        help="classes whose boxes are cut out of the kept regions (e.g. ANUS_EXPOSED)")
     parser.add_argument("--conf", type=float, default=DetectorConfig.conf)
     parser.add_argument("--iou", type=float, default=DetectorConfig.iou)
     parser.add_argument("--imgsz", type=int, help="model input size (default: from the model)")
@@ -269,7 +304,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overwrite", action="store_true", help="annotate videos that already have a region file")
     args = parser.parse_args(argv)
 
-    detector_config = DetectorConfig(conf=args.conf, iou=args.iou, imgsz=args.imgsz, classes=tuple(args.classes))
+    detector_config = DetectorConfig(
+        conf=args.conf, iou=args.iou, imgsz=args.imgsz, classes=tuple(args.classes), exclude=tuple(args.exclude_classes)
+    )
     config = AnnotateConfig(
         batch=args.batch, stride=args.stride, grow=args.grow,
         min_track_seconds=args.min_track_seconds, max_gap_seconds=args.max_gap_seconds,
@@ -282,12 +319,32 @@ def main(argv: list[str] | None = None) -> int:
         if video.stem in seen:
             sys.exit(f"reveil-annotate: {video} and {seen[video.stem]} share the name {video.stem!r}; rename one")
         seen[video.stem] = video
-    jobs = [v for v in videos if args.overwrite or not (args.out / f"{v.stem}.json").is_file()]
-    print(f"{len(videos)} videos, {len(videos) - len(jobs)} already annotated", flush=True)
 
-    detector = YoloOnnx(args.model, detector_config)  # also checks the model and the class list
+    detector = YoloOnnx(args.model, detector_config)  # also checks the model and the class lists
     print(f"model {args.model.name}: {detector.task}, input {detector.size}, classes {detector.names}, "
-          f"keeping {detector.kept_classes}, on {detector.providers[0]}", flush=True)
+          f"keeping {detector.kept_classes}, cutting out {detector.excluded_classes}, on {detector.providers[0]}",
+          flush=True)
+
+    # Region files are reused only if they were written with the same settings.
+    settings = {
+        "version": SETTINGS_VERSION, "model": args.model.name, "classes": detector.kept_classes,
+        "exclude": detector.excluded_classes, "conf": args.conf, "iou": args.iou, "imgsz": detector.size,
+        "stride": config.stride, "grow": config.grow,
+        "min_track_seconds": config.min_track_seconds, "max_gap_seconds": config.max_gap_seconds,
+    }
+    settings_path = args.out / SETTINGS_FILE
+    try:
+        changed = json.loads(settings_path.read_text()) != settings
+    except (OSError, ValueError):
+        changed = True
+    done = [v for v in videos if (args.out / f"{v.stem}.json").is_file()]
+    if changed and done:
+        print(f"the settings differ from those of the {len(done)} existing region files: annotating them again",
+              flush=True)
+    jobs = [v for v in videos if args.overwrite or changed or v not in done]
+    print(f"{len(videos)} videos, {len(videos) - len(jobs)} already annotated", flush=True)
+    args.out.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=1))
 
     def report(done: int, video: Path, result: dict | None, error: Exception | None) -> None:
         if error is None:
