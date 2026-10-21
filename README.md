@@ -45,7 +45,7 @@ python -m reveil.annotate --videos sources/ --model detector.onnx --out regions/
 - `--preview-dir` 每部影片輸出一張預覽圖，綠線是標註；產生配對前先看過。
 - 已經有標註檔的影片會跳過，`--overwrite` 重做。
 
-Colab notebook 預設用 [Lada](https://github.com/ladaapp/lada) 的 NSFW 分割模型 `lada_nsfw_detection_model_v1.3`（Hugging Face `ladaapp/lada`）。
+Colab notebook 預設用 [NudeNet](https://github.com/notAI-tech/NudeNet) 的 `640m` 偵測模型，只取 `FEMALE_GENITALIA_EXPOSED` 和 `MALE_GENITALIA_EXPOSED` 兩類：一般有碼片只遮生殖器，肛門不打碼，假馬賽克也要一樣。也可以改用 [Lada](https://github.com/ladaapp/lada) 的分割模型 `lada_nsfw_detection_model_v1.3`；它只有一類 `nsfw`，會連肛門一起標。每個偵測模型的標註和預覽各放一個資料夾（`regions/<偵測模型>/`、`previews/<偵測模型>/`），換模型就會重新標註。
 
 產生配對：
 
@@ -87,9 +87,9 @@ mosaic: {block_fraction: [0.008, 0.015], blur_probability: 0.0}
 - A100 執行階段。80GB 最好；40GB 也可以：標註、配對、前處理都一樣，訓練時底模自動改用 INT8 量化（`int8-quanto`，約 22 GB），每步比較慢。checkpoint 在兩種卡之間可以互相接著訓練。
 - Colab 密鑰 `HF_TOKEN`（先在 Hugging Face 同意 LTX-2.5 的條款）
 - 訓練用的無碼影片：預設讀 Drive 上的 `reveil/sources/FC2/`，可以是指到別人分享資料夾的 Drive 捷徑，子資料夾也會讀。設定裡的 `SOURCES` 可以改成別的資料夾，或列好幾個。有碼片（例如 `reveil/sources/` 裡的 AV）留給之後去碼用，不要列進 `SOURCES`。
-- `reveil/regions/`（標註）會自動產生，也可以自己放
+- `reveil/regions/<偵測模型>/`（標註）會自動產生，也可以自己放
 
-notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。偵測模型第一次匯出成 ONNX 後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。每部影片最多取 `MAX_WINDOWS_PER_VIDEO` 組配對（預設 100，隨機挑），讓資料平均來自不同影片；正式訓練的配對少於 `MIN_SAMPLES`（預設 100）時，notebook 會停下來不訓練。
+notebook 依序安裝、下載 LTX-2.5（約 72 GB）、自動標註、產生配對、前處理、訓練。標註前會先確認每部影片都讀得到，Drive 掛載出問題就馬上停下來。偵測模型第一次下載後存在 Drive 的 `reveil/models/`，標註預覽在 `reveil/previews/<偵測模型>/`。checkpoint 每 250 步存到 Drive，斷線後重跑整本會從最新的 checkpoint 續訓。第一次建議先開 `SMOKE_TEST`（隨機區域、不標註），確認整條流程能跑通。每部影片最多取 `MAX_WINDOWS_PER_VIDEO` 組配對（預設 100，隨機挑），讓資料平均來自不同影片；正式訓練的配對少於 `MIN_SAMPLES`（預設 100）時，notebook 會停下來不訓練。
 
 訓練設定在 `configs/ic_lora_512.yaml`：LoRA rank 32、學習率 2e-4、3000 步、batch 1、bf16、gradient checkpointing；只有 reference 條件，沒有 first_frame 條件。
 
@@ -106,4 +106,4 @@ pytest
 
 Reveil 的程式碼採用 Apache-2.0。LTX-2.5 的權重和 Lightricks 的 `ltx-trainer` 屬於 LTX-2.x Community License，使用時須遵守該授權及其 Acceptable Use Policy。
 
-Lada 的偵測模型和匯出用的 ultralytics 都是 AGPL-3.0。Reveil 不包含它們，也不 import 它們：notebook 在你的執行階段下載模型，並用獨立的 `yolo` 指令匯出。
+NudeNet 和 Lada 的偵測模型、匯出用的 ultralytics 都是 AGPL-3.0。Reveil 不包含它們，也不 import 它們：notebook 在你的執行階段下載模型（Lada 的權重再用獨立的 `yolo` 指令匯出成 ONNX）。

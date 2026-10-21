@@ -23,14 +23,17 @@ def textured_frames(count: int, width: int, height: int, seed: int = 0):
         yield np.clip(base * 0.75 + noise, 0, 255).astype(np.uint8)
 
 
-def write_yolo_onnx(path: Path, *, task: str = "segment", size: int = 64) -> Path:
+def write_yolo_onnx(
+    path: Path, *, task: str = "segment", size: int = 64, names: tuple[str, ...] = ("region", "other")
+) -> Path:
     """A stand-in for an exported ultralytics model: whatever the input, it predicts a
-    'region' box (24, 24, 40, 40) with a near duplicate, a low-score box, and an 'other'
-    box (46, 46, 54, 54), in input pixels; segment models also get prototype masks."""
+    box (24, 24, 40, 40) of class 0 ('region') with a near duplicate, a low-score box, and a
+    box (46, 46, 54, 54) of class 1 ('other'), in input pixels; segment models also get
+    prototype masks. Further ``names`` are classes it never predicts."""
     onnx = pytest.importorskip("onnx")
     from onnx import TensorProto, helper, numpy_helper
 
-    classes, masks, anchors = 2, 32 if task == "segment" else 0, 4
+    classes, masks, anchors = len(names), 32 if task == "segment" else 0, 4
     pred = np.zeros((1, 4 + classes + masks, anchors), np.float32)
     for a, (cx, cy, w, h, cls, score) in enumerate(
         [(32, 32, 16, 16, 0, 0.9), (33, 32, 16, 16, 0, 0.8), (10, 10, 6, 6, 0, 0.1), (50, 50, 8, 8, 1, 0.95)]
@@ -72,7 +75,7 @@ def write_yolo_onnx(path: Path, *, task: str = "segment", size: int = 64) -> Pat
         opset_imports=[helper.make_opsetid("", 13)],
     )
     model.ir_version = 8
-    helper.set_model_props(model, {"names": "{0: 'region', 1: 'other'}", "task": task, "imgsz": f"[{size}, {size}]"})
+    helper.set_model_props(model, {"names": str(dict(enumerate(names))), "task": task, "imgsz": f"[{size}, {size}]"})
     onnx.checker.check_model(model)
     onnx.save(model, str(path))
     return path
