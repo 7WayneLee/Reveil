@@ -13,6 +13,7 @@ A regions file is JSON written by any detector or annotation tool::
 
 Frame keys are 0-based decode indices and coordinates are source pixels. ``cuts`` is
 optional: the first frame after each scene cut, so no track or window spans a cut.
+Optional ``overlays`` locate logos or watermarks present on only one side of a real pair.
 """
 
 from __future__ import annotations
@@ -71,12 +72,49 @@ def _compact(value: float) -> float | int:
     return int(value) if value.is_integer() else value
 
 
+@dataclass(frozen=True)
+class Overlay:
+    """A logo or watermark present on one side of a pair, in retail source pixels."""
+
+    box: Box
+    side: str
+    frequency: float
+    frames: tuple[int, int] | None = None
+
+    def active(self, index: int) -> bool:
+        """Whether the overlay is present at this retail frame index."""
+        return self.frames is None or self.frames[0] <= index < self.frames[1]
+
+    def active_between(self, start: int, stop: int) -> bool:
+        """Whether any frame in the half-open retail range can show the overlay."""
+        if stop <= start:
+            return False
+        return self.frames is None or max(start, self.frames[0]) < min(stop, self.frames[1])
+
+    @classmethod
+    def from_json(cls, item: dict) -> Overlay:
+        frames = item.get("frames")
+        return cls(
+            Region.from_json({"box": item["box"]}).box,
+            item["side"],
+            float(item["frequency"]),
+            tuple(frames) if frames is not None else None,
+        )
+
+    def to_json(self) -> dict:
+        item = {"box": [_compact(v) for v in self.box], "side": self.side, "frequency": self.frequency}
+        if self.frames is not None:
+            item["frames"] = list(self.frames)
+        return item
+
+
 @dataclass
 class RegionSet:
-    """Regions per frame index, plus the scene cuts no track may cross."""
+    """Regions per frame index, scene cuts, and overlays to exclude from real pairs."""
 
     frames: dict[int, list[Region]] = field(default_factory=dict)
     cuts: frozenset[int] = frozenset()
+    overlays: tuple[Overlay, ...] = ()
 
 
 def load_regions(path: str | Path) -> RegionSet:
@@ -88,12 +126,23 @@ def load_regions(path: str | Path) -> RegionSet:
         for index, items in data.get("frames", {}).items()
         if items
     }
-    return RegionSet(frames, frozenset(int(cut) for cut in data.get("cuts", [])))
+    return RegionSet(
+        frames,
+        frozenset(int(cut) for cut in data.get("cuts", [])),
+        tuple(Overlay.from_json(item) for item in data.get("overlays", [])),
+    )
 
 
-def save_regions(regions: RegionSet, path: str | Path, *, dropped: dict[int, list[Region]] | None = None) -> None:
+def save_regions(
+    regions: RegionSet,
+    path: str | Path,
+    *,
+    dropped: dict[int, list[Region]] | None = None,
+    extra: dict | None = None,
+) -> None:
     """``dropped``: regions a detector found but that are not to be censored (kept for
-    previews and for checking thresholds; loaders ignore them)."""
+    previews and for checking thresholds). ``extra`` adds top-level metadata; loaders
+    ignore both it and ``dropped``."""
     data = {
         "version": 1,
         "frames": {str(index): [r.to_json() for r in items] for index, items in sorted(regions.frames.items())},
@@ -101,6 +150,10 @@ def save_regions(regions: RegionSet, path: str | Path, *, dropped: dict[int, lis
     }
     if dropped:
         data["dropped"] = {str(index): [r.to_json() for r in items] for index, items in sorted(dropped.items())}
+    if regions.overlays:
+        data["overlays"] = [overlay.to_json() for overlay in regions.overlays]
+    if extra:
+        data.update(extra)
     path = Path(path)
     partial = path.with_name(path.name + ".part")
     partial.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
