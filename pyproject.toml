@@ -22,6 +22,7 @@ dev = ["pytest>=8", "onnx>=1.16", "onnxruntime>=1.18"]
 
 [project.scripts]
 reveil-make-pairs = "reveil.make_pairs:main"
+reveil-real-pairs = "reveil.real_pairs:main"
 reveil-conditions = "reveil.conditions:main"
 reveil-annotate = "reveil.annotate:main"
 
