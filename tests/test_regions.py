@@ -24,6 +24,19 @@ def test_regions_round_trip_through_json(tmp_path):
     np.testing.assert_allclose(loaded.frames[5][0].polygon, [[0, 0], [30, 0], [30, 40]])
 
 
+@pytest.mark.parametrize("shape", [{"box": [1, 2, 20, 30]}, {"polygon": [[1, 2], [20, 2], [20, 30]]}])
+@pytest.mark.parametrize("block", [None, 20.0, 37.25])
+def test_region_block_round_trip(tmp_path, shape, block):
+    item = {**shape, **({"block": block} if block is not None else {})}
+    region = Region.from_json(item)
+    assert region.block == block
+    expected = {**shape, **({"block": round(block, 1)} if block is not None else {})}
+    assert region.to_json() == expected
+    path = tmp_path / "regions.json"
+    save_regions(RegionSet({0: [region]}), path)
+    assert load_regions(path).frames[0][0].block == (round(block, 1) if block is not None else None)
+
+
 def test_overlay_round_trip_with_and_without_frame_range(tmp_path):
     overlays = (
         Overlay((10, 20, 50, 60), "retail", 0.86, (1200, 54000)),
