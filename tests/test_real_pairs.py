@@ -220,8 +220,8 @@ def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, 
     save_regions(replace(data["regions"], overlays=()), regions_path)
     calls = []
 
-    def fake_decode(path):
-        calls.append(path)
+    def fake_decode(path, *, threads=None):
+        calls.append((path, threads))
         if path == alignment.retail:
             yield from data["retail"]
         else:
@@ -231,10 +231,10 @@ def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, 
     monkeypatch.setattr(module, "read_frames", fake_decode)
     config = replace(data["config"], target="leak", max_windows_per_title=2, colour_sample_frames=2)
     out = tmp_path / "out"
-    rows = build_title_pairs("TITLE", alignment_path, regions_path, out, config)
+    rows = build_title_pairs("TITLE", alignment_path, regions_path, out, config, decode_threads=3)
     assert len(rows) == 2
     assert any(np.any(np.diff(row["leak_indices"]) < 0) for row in rows)
-    assert calls == [alignment.retail, alignment.leak]
+    assert calls == [(alignment.retail, 3), (alignment.leak, 3)]
     for row in rows:
         gain, offset = np.array(row["colour_fit"]["a"]), np.array(row["colour_fit"]["b"])
         for index, target in enumerate(read_frames(out / row["video"])):

@@ -20,6 +20,10 @@ from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+# Each title has its own process; small dot products must not spin up BLAS pools.
+for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
 import cv2
 import numpy as np
 import yaml
@@ -310,7 +314,7 @@ class _WindowBuffer:
 
 
 def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[RealWindowPlan],
-            out_dir: Path, temp_dir: Path, config: RealPairConfig) -> list[dict]:
+            out_dir: Path, temp_dir: Path, config: RealPairConfig, decode_threads: int = 2) -> list[dict]:
     demands = defaultdict(list)
     for plan in plans:
         for index, leak_index in enumerate(plan.leak_indices):
@@ -327,7 +331,7 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
     plan = next(upcoming, None)
     leak_position = -1
     last_frame = max(p.start + len(p.crops) for p in plans) - 1
-    with closing(read_frames(alignment.retail)) as retail_frames, closing(read_frames(alignment.leak)) as leak_frames:
+    with closing(read_frames(alignment.retail, threads=decode_threads)) as retail_frames, closing(read_frames(alignment.leak, threads=decode_threads)) as leak_frames:
         for frame_index, retail in enumerate(retail_frames):
             while plan is not None and plan.start == frame_index:
                 render = buffer(plan)
@@ -366,9 +370,10 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
 
 def build_title_pairs(
     title: str, alignment_path: str | Path, regions_path: str | Path, out_dir: str | Path,
-    config: RealPairConfig = RealPairConfig(), *, seed: int = 0, overwrite: bool = False,
+    config: RealPairConfig = RealPairConfig(), *, seed: int = 0, overwrite: bool = False, decode_threads: int = 2,
 ) -> list[dict]:
     """Build one title, resuming from its atomic metadata file when already complete."""
+    cv2.setNumThreads(1)
     out_dir = Path(out_dir)
     stem = safe_stem(title)
     meta_path = out_dir / "meta" / f"{stem}.json"
@@ -381,7 +386,7 @@ def build_title_pairs(
     rows = []
     if plans:
         with tempfile.TemporaryDirectory(prefix="reveil-real-") as temp_dir:
-            rows = _render(title, alignment, regions, plans, out_dir, Path(temp_dir), config)
+            rows = _render(title, alignment, regions, plans, out_dir, Path(temp_dir), config, decode_threads)
     meta = {"title": title, "retail": alignment.retail, "leak": alignment.leak, "windows": rows}
     _write_atomic(meta_path, json.dumps(meta))
     return rows
@@ -406,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target", choices=("composite", "leak"))
     parser.add_argument("--max-windows-per-title", type=int)
     parser.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)))
+    parser.add_argument("--decode-threads", type=int, default=2, help="threads per video decoder (default: 2)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--only", nargs="+", help="title stems to include")
@@ -416,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     config = replace(config, **overrides)
     if args.workers < 1:
         parser.error("--workers must be positive")
+    if args.decode_threads < 1:
+        parser.error("--decode-threads must be positive")
     jobs, stems = [], {}
     for alignment_path in sorted(args.align_dir.glob("*.json")):
         title = alignment_path.stem
@@ -439,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     with ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context("spawn")) as pool:
         futures = {
             pool.submit(build_title_pairs, title, alignment_path, regions_path, args.out, config,
-                        seed=args.seed, overwrite=args.overwrite): title
+                        seed=args.seed, overwrite=args.overwrite, decode_threads=args.decode_threads): title
             for _, title, alignment_path, regions_path in sorted(jobs, key=lambda job: job[0], reverse=True)
         }
         for done, future in enumerate(as_completed(futures), 1):

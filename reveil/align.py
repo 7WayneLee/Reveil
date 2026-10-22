@@ -19,17 +19,24 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+# Each title has its own process; small dot products must not spin up BLAS pools.
+for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
 import av
+import cv2
 import numpy as np
 
 from reveil.frame_map import Alignment, save_alignment
 from reveil.realpairs import find_real_pairs
 from reveil.video import VideoInfo
 
+SIGNATURE_VERSION = 2  # Full-resolution legal-range luma, averaged by OpenCV.
+
 
 @dataclass(frozen=True)
 class AlignConfig:
-    sig_size: tuple[int, int] = (32, 18)  # Width and height of the full-range grey signature.
+    sig_size: tuple[int, int] = (32, 18)  # Width and height of the legal-range luma signature.
     anchor_interval_s: float = 2.0  # Retail time between global-search anchors.
     search_fps: float = 6.0  # Leak frames per second in the global correlation search.
     candidates: int = 5  # Distinct leak neighbourhoods retained for each anchor.
@@ -61,24 +68,57 @@ class AlignConfig:
                 raise ValueError(f"{name} must be positive")
 
 
-def frame_signatures(path, *, config: AlignConfig = AlignConfig()) -> tuple[np.ndarray, np.ndarray, VideoInfo]:
-    """Decode once in presentation order, keeping PTS and area-scaled full-range grey.
+def _luma(frame: av.VideoFrame) -> np.ndarray:
+    """Borrow 8-bit planar YUV luma, falling back to full-resolution grey conversion."""
+    fmt = frame.format
+    if (fmt.name.startswith("yuv") and not fmt.name.startswith("yuvj") and fmt.is_planar
+            and all(component.bits == 8 for component in fmt.components)):
+        return np.frombuffer(frame.planes[0], np.uint8).reshape(frame.height, frame.planes[0].line_size)[:, :frame.width]
+    return frame.to_ndarray(format="gray")
 
-    Conversion to grey expands limited-range YUV to full range before scaling. Never
-    retain a source frame after its signature has been copied into the output buffer.
+
+def _repair_times(times, fps: float) -> tuple[np.ndarray, int]:
+    """Interpolate absent PTS, then separate repeated/backward times by a microsecond."""
+    repaired = np.asarray(times, np.float64).copy()
+    missing = ~np.isfinite(repaired)
+    indices = np.arange(len(repaired))
+    finite = indices[~missing]
+    if len(finite):
+        inside = missing & (indices > finite[0]) & (indices < finite[-1])
+        repaired[inside] = np.interp(indices[inside], finite, repaired[finite])
+        ends = missing & ~inside
+        repaired[ends] = indices[ends] / fps
+    else:
+        repaired[:] = indices / fps
+    count = int(missing.sum())
+    for index in range(1, len(repaired)):
+        if repaired[index] <= repaired[index - 1]:
+            repaired[index] = repaired[index - 1] + 1e-6
+            count += int(not missing[index])
+    return repaired, count
+
+
+def frame_signatures(path, *, config: AlignConfig = AlignConfig(), decode_threads: int = 2,
+                     stats: dict | None = None) -> tuple[np.ndarray, np.ndarray, VideoInfo]:
+    """Decode once, keeping repaired PTS and area-averaged, clipped luma signatures.
+
+    ``stats`` optionally receives the number of repaired presentation times.
+    Source frames are discarded after their signatures have been copied.
     """
     times, blocks, block = [], [], np.empty((4096, config.sig_size[1], config.sig_size[0]), np.uint8)
     used, total = 0, 0
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
+        stream.codec_context.thread_count = decode_threads
         fps = float(stream.average_rate or stream.guessed_rate or 24)
         width, height = stream.codec_context.width, stream.codec_context.height
         for frame in container.decode(stream):
-            # Swscale's grey output is full range, including for limited-range YUV.
-            small = frame.to_ndarray(format="gray", width=config.sig_size[0], height=config.sig_size[1], interpolation="AREA")
+            # Swscale AREA aliases at large reductions. Clip super-whites before
+            # averaging so legal-range retail and unrestricted leaks agree.
+            small = cv2.resize(np.clip(_luma(frame), 16, 235), config.sig_size, interpolation=cv2.INTER_AREA)
             block[used] = small
-            timestamp = float(frame.pts * frame.time_base) if frame.pts is not None else total / fps
+            timestamp = float(frame.pts * frame.time_base) if frame.pts is not None and frame.time_base is not None else np.nan
             times.append(timestamp)
             used, total = used + 1, total + 1
             if used == len(block):
@@ -87,15 +127,23 @@ def frame_signatures(path, *, config: AlignConfig = AlignConfig()) -> tuple[np.n
     if used:
         blocks.append(block[:used].copy())
     signatures = np.concatenate(blocks) if blocks else np.empty((0, config.sig_size[1], config.sig_size[0]), np.uint8)
-    return np.asarray(times, np.float64), signatures, VideoInfo(width, height, fps, total)
+    times, repaired = _repair_times(times, fps)
+    if stats is not None:
+        stats["repaired_times"] = repaired
+    return times, signatures, VideoInfo(width, height, fps, total)
 
 
-def _cached_signatures(path: Path, cache_dir: Path | None, config: AlignConfig):
+def _cached_signatures(path: Path, cache_dir: Path | None, config: AlignConfig, decode_threads: int):
+    def decode():
+        stats = {}
+        times, signatures, info = frame_signatures(path, config=config, decode_threads=decode_threads, stats=stats)
+        return times, signatures, info, stats["repaired_times"]
+
     if cache_dir is None:
-        return frame_signatures(path, config=config)
+        return decode()
     path = path.absolute()
     stat = path.stat()
-    key = hashlib.sha1(f"{path}\0{stat.st_size}\0{stat.st_mtime_ns}".encode()).hexdigest()
+    key = hashlib.sha1(f"{SIGNATURE_VERSION}\0{path}\0{stat.st_size}\0{stat.st_mtime_ns}".encode()).hexdigest()
     cache_dir.mkdir(parents=True, exist_ok=True)
     target = cache_dir / f"{key}.npz"
     if target.is_file():
@@ -104,15 +152,16 @@ def _cached_signatures(path: Path, cache_dir: Path | None, config: AlignConfig):
                 signatures = cached["signatures"]
                 if signatures.shape[1:] == config.sig_size[::-1]:
                     width, height, fps, frames = cached["info"].tolist()
-                    return cached["times"], signatures, VideoInfo(int(width), int(height), fps, int(frames))
+                    return cached["times"], signatures, VideoInfo(int(width), int(height), fps, int(frames)), int(cached["repaired_times"])
         except (OSError, ValueError, KeyError):
             pass  # An interrupted or obsolete cache is safe to rebuild.
-    result = frame_signatures(path, config=config)
-    times, signatures, info = result
+    result = decode()
+    times, signatures, info, repaired = result
     with tempfile.NamedTemporaryFile(dir=cache_dir, suffix=".npz", delete=False) as partial:
         temporary = Path(partial.name)
     try:
-        np.savez(temporary, times=times, signatures=signatures, info=np.array([info.width, info.height, info.fps, info.frames]))
+        np.savez(temporary, times=times, signatures=signatures, repaired_times=repaired,
+                 info=np.array([info.width, info.height, info.fps, info.frames]))
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -387,21 +436,23 @@ def align_signatures(t_a, sig_a, t_b, sig_b, config: AlignConfig = AlignConfig()
     return runs, reported, stats
 
 
-def align_pair(retail, leak, *, cache_dir=None, config: AlignConfig = AlignConfig()) -> Alignment:
+def align_pair(retail, leak, *, cache_dir=None, config: AlignConfig = AlignConfig(), decode_threads: int = 2) -> Alignment:
     started = time.perf_counter()
     retail, leak = Path(retail), Path(leak)
     cache_dir = Path(cache_dir) if cache_dir is not None else None
-    t_a, sig_a, a = _cached_signatures(retail, cache_dir, config)
-    t_b, sig_b, b = _cached_signatures(leak, cache_dir, config)
+    t_a, sig_a, a, repaired_a = _cached_signatures(retail, cache_dir, config, decode_threads)
+    t_b, sig_b, b, repaired_b = _cached_signatures(leak, cache_dir, config, decode_threads)
     decode_s = time.perf_counter() - started
     runs, segments, stats = align_signatures(t_a, sig_a, t_b, sig_b, config)
+    stats["repaired_times"] = {"retail": repaired_a, "leak": repaired_b}
     stats["timings"].update(decode_s=decode_s, total_s=time.perf_counter() - started)
     return Alignment(str(retail), str(leak), len(t_a), len(t_b), a.fps, b.fps, (int(a.width), int(a.height)),
                      (int(b.width), int(b.height)), tuple(runs), tuple(segments), stats)
 
 
-def _align_job(title, retail, leak, output, cache):
-    alignment = align_pair(retail, leak, cache_dir=cache)
+def _align_job(title, retail, leak, output, cache, decode_threads=2):
+    cv2.setNumThreads(1)
+    alignment = align_pair(retail, leak, cache_dir=cache, decode_threads=decode_threads)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_alignment(alignment, output)
     offsets = ", ".join(f"{segment['offset_s']:+.3f}s" for segment in alignment.segments) or "none"
@@ -417,11 +468,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True, help="alignment directory, or JSON path in single-pair mode")
     parser.add_argument("--cache", type=Path, help="reuse decoded signature arrays")
     parser.add_argument("--workers", type=int, default=1, help="one title per spawned process")
+    parser.add_argument("--decode-threads", type=int, default=2, help="threads per video decoder (default: 2)")
     parser.add_argument("--overwrite", action="store_true", help="replace completed alignment files")
     parser.add_argument("--only", nargs="+", help="align only these title directory names")
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be positive")
+    if args.decode_threads < 1:
+        parser.error("--decode-threads must be positive")
     single = args.retail is not None or args.leak is not None
     if single:
         if args.retail is None or args.leak is None or args.censored is not None or args.uncensored is not None or args.only:
@@ -444,13 +498,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.workers == 1:
         for job in pending:
             try:
-                print(_align_job(*job), flush=True)
+                print(_align_job(*job, decode_threads=args.decode_threads), flush=True)
             except Exception as error:  # noqa: BLE001 - other titles can still finish
                 print(f"{job[0]}: FAILED: {error!r}", file=sys.stderr, flush=True)
                 failed += 1
     elif pending:
         with ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context("spawn")) as pool:
-            futures = {pool.submit(_align_job, *job): job[0] for job in pending}
+            futures = {pool.submit(_align_job, *job, decode_threads=args.decode_threads): job[0] for job in pending}
             for future in as_completed(futures):
                 try:
                     print(future.result(), flush=True)

@@ -1,6 +1,7 @@
 import json
 import time
 
+import av
 import cv2
 import numpy as np
 import pytest
@@ -126,6 +127,8 @@ def test_cli_metadata_skip_filter_and_spawn(real_pair, tmp_path, capsys):
     data = json.loads((out / "title.json").read_text())
     assert data["settings"]["alignment"] == str(aligns / "title.json")
     assert data["settings"]["stride"] == 2
+    assert data["settings"]["block_min_fraction"] == 0.0075
+    assert "block_min" not in data["settings"]
     assert data["stats"]["frames_analysed"] == 80
     assert data["stats"]["overlay_count"] == 1
     assert all("block" in item for items in data["frames"].values() for item in items)
@@ -156,13 +159,14 @@ def test_forward_decode_cuts_unmatched_frames_and_unequal_sizes(monkeypatch):
     retail = [np.full((90, 160, 3), 50 if i < 3 else 180, np.uint8) for i in range(8)]
     leak = [cv2.resize(frame, (320, 180)) for frame in retail]
 
-    def read(path):
+    def read(path, threads):
+        assert threads == 2
         frames = retail if path == "retail" else leak
         for index, frame in enumerate(frames):
             decoded[path].append(index)
-            yield frame
+            yield av.VideoFrame.from_ndarray(frame, format="rgb24").reformat(format="yuv420p")
 
-    monkeypatch.setattr(module, "read_frames", read)
+    monkeypatch.setattr(module, "_decoded_frames", read)
     alignment = Alignment("retail", "leak", 8, 8, 30, 30, (160, 90), (320, 180), ((0, 0, 2), (4, 4, 4)))
     progress = []
     result = mosaic_regions_for_pair(alignment, MaskConfig(), progress=lambda done, total: progress.append((done, total)))
@@ -176,16 +180,16 @@ def test_forward_decode_cuts_unmatched_frames_and_unequal_sizes(monkeypatch):
 def test_logos_appear_only_in_their_chunks_on_either_side(monkeypatch):
     import reveil.realmask as module
 
-    def read(path):
+    def read(path, threads):
         for index in range(120):
             frame = np.broadcast_to((40 + np.arange(160, dtype=np.uint8))[None, :, None], (90, 160, 3)).copy()
             if (path == "retail" and 40 <= index < 80) or (path == "leak" and index >= 80):
                 cv2.rectangle(frame, (136, 6), (155, 21), (20, 20, 20), -1)
                 cv2.line(frame, (139, 8), (151, 18), (235, 235, 235), 3)
                 cv2.line(frame, (139, 18), (151, 8), (235, 235, 235), 3)
-            yield frame
+            yield av.VideoFrame.from_ndarray(frame, format="rgb24").reformat(format="yuv420p")
 
-    monkeypatch.setattr(module, "read_frames", read)
+    monkeypatch.setattr(module, "_decoded_frames", read)
     alignment = Alignment("retail", "leak", 120, 120, 30, 30, (160, 90), (160, 90), ((0, 0, 120),))
     result = mosaic_regions_for_pair(alignment, MaskConfig(scale=1, overlay_chunk=40))
     assert not result.frames
@@ -226,7 +230,7 @@ def test_larger_leak_is_resized_and_measurements_use_retail_pixels(scale):
     assert area.retail_std < 3 and area.retail_std < 0.3 * area.leak_std
 
 
-@pytest.mark.parametrize("kwargs", [{"stride": 0}, {"scale": 0}, {"scale": 2}, {"block_max": 7}])
+@pytest.mark.parametrize("kwargs", [{"stride": 0}, {"scale": 0}, {"scale": 2}, {"block_max": 3}, {"block_min_fraction": 0}])
 def test_invalid_config(kwargs):
     with pytest.raises(ValueError):
         MaskConfig(**kwargs)
@@ -237,12 +241,12 @@ def test_backward_alignment_is_skipped_and_analysis_resumes(monkeypatch, tmp_pat
 
     decoded = {"retail": [], "leak": []}
 
-    def read(path):
+    def read(path, threads):
         for index in range(16):
             decoded[path].append(index)
-            yield np.full((90, 160, 3), 100, np.uint8)
+            yield av.VideoFrame.from_ndarray(np.full((90, 160), 100, np.uint8), format="gray")
 
-    monkeypatch.setattr(module, "read_frames", read)
+    monkeypatch.setattr(module, "_decoded_frames", read)
     alignment = Alignment("retail", "leak", 16, 16, 30, 30, (160, 90), (160, 90),
                           ((0, 4, 4), (4, 0, 4), (8, 8, 8)))
     result = mosaic_regions_for_pair(alignment, MaskConfig())
@@ -256,3 +260,67 @@ def test_backward_alignment_is_skipped_and_analysis_resumes(monkeypatch, tmp_pat
     assert main(["--align-dir", str(aligns), "--out", str(tmp_path / "regions")]) == 0
     warning = capsys.readouterr().err
     assert warning.count("warning:") == 1 and "skipped 4 retail frames" in warning
+
+
+@pytest.mark.parametrize("width,height,block,accepted", [
+    (1920, 1080, 8, False), (1920, 1080, 16, True),
+    (1280, 720, 8, False), (1280, 720, 12, True),
+])
+def test_codec_grid_is_rejected_relative_to_resolution(width, height, block, accepted):
+    rng = np.random.default_rng(30)
+    leak = rng.integers(30, 225, (height, width, 3), dtype=np.uint8)
+    mask = np.zeros((height, width), bool)
+    mask[height // 3:2 * height // 3, width // 3:2 * width // 3] = True
+    retail = pixelate(leak, mask, block, (0, 0))
+    areas = frame_mosaic(cv2.cvtColor(retail, cv2.COLOR_RGB2GRAY), cv2.cvtColor(leak, cv2.COLOR_RGB2GRAY), MaskConfig())
+    if not accepted:
+        assert not areas
+    else:
+        assert len(areas) == 1 and areas[0].block == pytest.approx(block, rel=0.15)
+
+
+def test_only_analysed_leak_frames_are_converted(monkeypatch):
+    import reveil.realmask as module
+
+    converted, decoded = [], []
+    luma = module._luma
+
+    def read(path, threads):
+        assert threads == 3
+        for index in range(16 if path == "leak" else 8):
+            frame = av.VideoFrame.from_ndarray(np.full((90, 160), 100, np.uint8), format="gray")
+            frame.pts = index
+            decoded.append((path, index))
+            yield frame
+
+    def record(frame):
+        converted.append(frame.pts)
+        return luma(frame)
+
+    monkeypatch.setattr(module, "_decoded_frames", read)
+    monkeypatch.setattr(module, "_luma", record)
+    alignment = Alignment("retail", "leak", 8, 16, 30, 60, (160, 90), (160, 90),
+                          tuple((i, 2 * i, 1) for i in range(8)))
+    result = mosaic_regions_for_pair(alignment, MaskConfig(), decode_threads=3)
+    assert result.stats["frames_analysed"] == 4
+    assert [i for side, i in decoded if side == "leak"] == list(range(13))
+    assert len(converted) == 8 + 4
+    assert converted == [0, 0, 1, 2, 4, 3, 4, 8, 5, 6, 12, 7]
+
+
+def test_luma_and_rgb_processing_agree_on_encoded_fixture(real_pair, monkeypatch):
+    import reveil.realmask as module
+
+    _, alignment, luma_result, _ = real_pair
+    monkeypatch.setattr(module, "_luma", lambda frame: cv2.cvtColor(frame.to_ndarray(format="rgb24"), cv2.COLOR_RGB2GRAY))
+    # Restore the old RGB-to-grey input on generated footage for this comparison.
+    monkeypatch.setattr(module, "_FULL_RANGE", np.arange(256, dtype=np.uint8))
+    grey_result = mosaic_regions_for_pair(alignment, MaskConfig())
+    assert grey_result.cuts == luma_result.cuts
+    assert len(grey_result.overlays) == len(luma_result.overlays) == 1
+    good = []
+    for index in range(20, 160, 2):
+        a = rasterize(luma_result.frames.get(index, []), (0, 0), (360, 640), ellipse=False)
+        b = rasterize(grey_result.frames.get(index, []), (0, 0), (360, 640), ellipse=False)
+        good.append((a & b).sum() / max(1, (a | b).sum()) >= 0.7)
+    assert np.mean(good) >= 0.9

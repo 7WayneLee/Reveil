@@ -1,13 +1,18 @@
 from dataclasses import replace
 from pathlib import Path
+import hashlib
+import json
+import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
+import av
 import cv2
 import numpy as np
 import pytest
 
-from reveil.align import AlignConfig, align_pair, align_signatures, frame_signatures, main
+from reveil.align import AlignConfig, _repair_times, align_pair, align_signatures, frame_signatures, main
 from reveil.frame_map import load_alignment
 from reveil.mosaic import MosaicStyle, censor
 from reveil.realpairs import find_real_pairs
@@ -288,3 +293,169 @@ def test_invalid_timestamps_and_config():
         AlignConfig(search_fps=0)
     with pytest.raises(ValueError, match="strictly increasing"):
         align_signatures([0, 0], np.zeros((2, 18, 32)), [0, 1], np.zeros((2, 18, 32)))
+
+
+@pytest.mark.parametrize("codec,pixel_format,suffix", [
+    ("libx264", "yuv420p", ".mp4"), ("mjpeg", "yuvj420p", ".avi"),
+    ("ffv1", "yuv420p10le", ".mkv"),
+])
+def test_signatures_area_average_decoded_luma(tmp_path, codec, pixel_format, suffix):
+    path = tmp_path / ("signature" + suffix)
+    rng = np.random.default_rng(11)
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream(codec, rate=12)
+        stream.width, stream.height, stream.pix_fmt = 194, 110, pixel_format
+        for _ in range(4):
+            image = rng.integers(0, 256, (110, 194, 3), np.uint8)
+            image[:, :60], image[:, 120:] = 0, 255
+            for packet in stream.encode(av.VideoFrame.from_ndarray(image, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    expected = []
+    with av.open(str(path)) as container:
+        for frame in container.decode(video=0):
+            assert frame.format.name == pixel_format
+            if pixel_format == "yuv420p":
+                y = np.frombuffer(frame.planes[0], np.uint8).reshape(frame.height, frame.planes[0].line_size)[:, :frame.width]
+            else:
+                y = frame.to_ndarray(format="gray")
+            expected.append(cv2.resize(y.clip(16, 235), (32, 18), interpolation=cv2.INTER_AREA))
+    _, signatures, _ = frame_signatures(path)
+    np.testing.assert_array_equal(signatures, expected)
+
+
+def test_repair_repeated_backward_missing_and_end_times():
+    times = [np.nan, 1 / 30, 2 / 30, 2 / 30, 2 / 30 - 0.0003, np.nan, 6 / 30, np.inf]
+    repaired, count = _repair_times(times, 30)
+    assert np.isfinite(repaired).all() and (np.diff(repaired) > 0).all()
+    assert count == 5
+    assert repaired[3] == pytest.approx(repaired[2] + 1e-6)
+    assert repaired[4] == pytest.approx(repaired[3] + 1e-6)
+    assert repaired[5] == pytest.approx((times[4] + times[6]) / 2)
+    np.testing.assert_allclose(repaired[[0, 1, 2, 6, 7]], np.array([0, 1, 2, 6, 7]) / 30)
+    np.testing.assert_array_equal(_repair_times([], 30)[0], [])
+    repaired, count = _repair_times([np.nan, np.inf, None], 30)
+    np.testing.assert_allclose(repaired, np.arange(3) / 30)
+    assert count == 3
+
+
+def test_alignment_repairs_decoded_times_and_caches_counts(tmp_path, monkeypatch):
+    import reveil.align as module
+
+    retail, leak = tmp_path / "retail.mp4", tmp_path / "leak.mp4"
+    source = scenes(180)
+    write_video(retail, source, FPS, crf=18)
+    write_video(leak, scenes(15, 4) + source, FPS, crf=18)
+    original_open = av.open
+
+    class PerturbedContainer:
+        def __init__(self, path):
+            self.container = original_open(path)
+            self.streams = self.container.streams
+            self.perturb = path == str(retail)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.container.close()
+
+        def decode(self, stream):
+            assert stream.codec_context.thread_count == 3
+            for index, frame in enumerate(self.container.decode(stream)):
+                pts = frame.pts
+                if self.perturb:
+                    if index == 30:
+                        pts = (index - 1) / FPS / float(frame.time_base)
+                    elif index == 60:
+                        pts = ((index - 1) / FPS - 0.0003) / float(frame.time_base)
+                    elif index == 90:
+                        pts = np.nan
+                    elif index == 120:
+                        pts = None
+                yield SimpleNamespace(pts=pts, time_base=frame.time_base, format=frame.format,
+                                      planes=frame.planes, width=frame.width, height=frame.height,
+                                      to_ndarray=frame.to_ndarray)
+
+    monkeypatch.setattr(module.av, "open", PerturbedContainer)
+    cache = tmp_path / "cache"
+    first = align_pair(retail, leak, cache_dir=cache, config=CONFIG, decode_threads=3)
+    assert_exact(first, np.arange(180) + 15, coverage=1)
+    assert first.stats["repaired_times"] == {"retail": 4, "leak": 0}
+    for path in cache.glob("*.npz"):
+        with np.load(path) as data:
+            assert (np.diff(data["times"]) > 0).all()
+    monkeypatch.setattr(module, "frame_signatures", lambda *a, **k: pytest.fail("cache was not reused"))
+    second = align_pair(retail, leak, cache_dir=cache, config=CONFIG)
+    assert second.runs == first.runs and second.stats["repaired_times"] == first.stats["repaired_times"]
+
+
+def test_obsolete_signature_cache_is_not_reused(tmp_path):
+    path, cache = tmp_path / "clip.mp4", tmp_path / "cache"
+    write_video(path, scenes(4), FPS)
+    cache.mkdir()
+    stat = path.stat()
+    old_key = hashlib.sha1(f"{path.absolute()}\0{stat.st_size}\0{stat.st_mtime_ns}".encode()).hexdigest()
+    np.savez(cache / f"{old_key}.npz", times=np.arange(4) / FPS, signatures=np.zeros((4, 18, 32), np.uint8),
+             info=np.array([128, 72, FPS, 4]))
+    align_pair(path, path, cache_dir=cache)
+    assert len(list(cache.glob("*.npz"))) == 2
+
+
+@pytest.mark.parametrize("module", ["align", "realmask", "real_pairs"])
+@pytest.mark.parametrize("override", [False, True])
+def test_cli_blas_thread_defaults_in_fresh_interpreter(module, override):
+    names = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+    env = os.environ.copy()
+    for name in names:
+        env.pop(name, None)
+        if override:
+            env[name] = "3"
+    code = f"import reveil.{module}; import json, os; print(json.dumps(dict(os.environ)))"
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    actual = json.loads(result.stdout)
+    assert all(actual[name] == ("3" if override else "1") for name in names)
+
+
+@pytest.mark.parametrize("module", ["align", "realmask", "real_pairs"])
+def test_cli_decode_threads_help(module):
+    result = subprocess.run([sys.executable, "-m", f"reveil.{module}", "--help"],
+                            capture_output=True, text=True, check=True)
+    assert "--decode-threads" in result.stdout
+
+
+@pytest.mark.parametrize("decoder", ["signature", "mask", "rgb"])
+def test_decoders_set_requested_thread_count(tmp_path, monkeypatch, decoder):
+    from reveil.realmask import _decoded_frames
+    from reveil.video import read_frames
+
+    path = tmp_path / "threads.mp4"
+    write_video(path, scenes(4), FPS)
+    original_open = av.open
+    calls = []
+
+    class Container:
+        def __init__(self, path):
+            self.container = original_open(path)
+            self.streams = self.container.streams
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.container.close()
+
+        def decode(self, stream):
+            calls.append(stream.codec_context.thread_count)
+            assert stream.thread_type == av.codec.context.ThreadType.AUTO
+            yield from self.container.decode(stream)
+
+    monkeypatch.setattr(av, "open", Container)
+    if decoder == "signature":
+        assert len(frame_signatures(path, decode_threads=3)[0]) == 4
+    elif decoder == "mask":
+        assert len(list(_decoded_frames(path, 3))) == 4
+    else:
+        assert len(list(read_frames(path, threads=3))) == 4
+    assert calls == [3]

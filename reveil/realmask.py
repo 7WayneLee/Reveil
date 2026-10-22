@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing
+import os
 import sys
 import time
 from collections import Counter
@@ -17,21 +18,28 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
+# Each title has its own process; small dot products must not spin up BLAS pools.
+for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
+import av
 import cv2
 import numpy as np
 
 from reveil.annotate import CutDetector, mask_regions
+from reveil.align import _luma
 from reveil.frame_map import Alignment, load_alignment
 from reveil.regions import Overlay, Region, RegionSet, save_regions
 from reveil.tracks import box_iou
-from reveil.video import read_frames
+
+_FULL_RANGE = np.rint((np.arange(256).clip(16, 235) - 16) * (255 / 219)).astype(np.uint8)
 
 
 @dataclass(frozen=True)
 class MaskConfig:
     scale: float = 0.5  # detection size over the retail size
     stride: int = 2  # analyse every stride-th retail frame
-    block_min: int = 8  # smallest grid period, in retail pixels
+    block_min_fraction: float = 0.0075  # smallest grid period over the retail long side, with a 4px floor
     block_max: int = 96  # largest grid period, in retail pixels
     residual_min: float = 8.0  # minimum blurred absolute residual, grey levels
     residual_sigma: float = 4.0  # residual threshold over robust noise sigma
@@ -58,8 +66,8 @@ class MaskConfig:
     def __post_init__(self) -> None:
         if not 0 < self.scale <= 1 or self.stride < 1:
             raise ValueError("scale must be in (0, 1] and stride must be positive")
-        if self.block_min < 4 or self.block_max < self.block_min:
-            raise ValueError("block range must be ordered and start at 4 pixels or more")
+        if self.block_min_fraction <= 0 or self.block_max < 4:
+            raise ValueError("block_min_fraction must be positive and block_max at least 4 pixels")
         if not 0 <= self.trim < 1 or self.fit_samples < 3 or self.overlay_chunk < 1:
             raise ValueError("invalid fit or chunk settings")
 
@@ -114,7 +122,9 @@ def _period(profile: np.ndarray, low: float, high: float, config: MaskConfig) ->
 
 def estimate_block(x_profile: np.ndarray, y_profile: np.ndarray, config: MaskConfig) -> float | None:
     """Grid period in detection pixels; either axis may be absent in a thin area."""
-    low, high = config.block_min * config.scale, config.block_max * config.scale
+    # Search below the acceptance minimum too: otherwise an 8px codec grid can
+    # masquerade as a 16px mosaic through its autocorrelation harmonics.
+    low, high = 4 * config.scale, config.block_max * config.scale
     x, y = (_period(p, low, high, config) for p in (x_profile, y_profile))
     if x is None or y is None:
         return (x or y)[0] if x is not None or y is not None else None
@@ -210,6 +220,7 @@ def _analyse(retail_grey: np.ndarray, leak_grey: np.ndarray, config: MaskConfig
     count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
     found, other = [], []
     scale = size[0] / width
+    block_min = max(4, config.block_min_fraction * max(width, height))
     for label in range(1, count):
         x, y, w, h, area = stats[label]
         if area < config.min_area * candidate.size:
@@ -230,7 +241,7 @@ def _analyse(retail_grey: np.ndarray, leak_grey: np.ndarray, config: MaskConfig
                     for p in (xp, yp)]
         block = estimate_block(*profiles, replace(config, scale=scale))
         accepted = False
-        if block is not None and block / scale >= config.block_min:
+        if block is not None and block / scale >= block_min:
             phase = _phase(xp, block, x0), _phase(yp, block, y0)
             local_phase = (phase[0] - x0) % block, (phase[1] - y0) % block
             cells = _cells(r, l, component, block, local_phase, config)
@@ -316,7 +327,17 @@ def _merge_overlays(previous: list[Overlay], chunk: list[Overlay], config: MaskC
             used.add(len(previous) - 1)
 
 
-def mosaic_regions_for_pair(alignment: Alignment, config: MaskConfig, *, progress=None) -> RegionSet:
+def _decoded_frames(path: str, threads: int):
+    """Yield decoded frames without converting frames skipped by the analysis stride."""
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        stream.codec_context.thread_count = threads
+        yield from container.decode(stream)
+
+
+def mosaic_regions_for_pair(alignment: Alignment, config: MaskConfig, *, progress=None,
+                            decode_threads: int = 2) -> RegionSet:
     """Detect a pair sequentially; the returned MosaicRegions also exposes ``stats``.
 
     ``progress(done, total)`` runs after every retail frame, including skipped frames.
@@ -329,13 +350,17 @@ def mosaic_regions_for_pair(alignment: Alignment, config: MaskConfig, *, progres
     chunk, chunk_start = _OverlayChunk(), 0
     analysed, leak_index, frame_count, skipped_backward = 0, -1, 0, 0
     leak_frame = None
-    retail_frames, leak_frames = read_frames(alignment.retail), read_frames(alignment.leak)
+    retail_frames = _decoded_frames(alignment.retail, decode_threads)
+    leak_frames = _decoded_frames(alignment.leak, decode_threads)
     try:
         for index, retail_frame in enumerate(retail_frames):
             if index >= alignment.retail_frames:
                 raise ValueError("retail contains more frames than its alignment")
             frame_count = index + 1
-            if detector(retail_frame) and index:
+            retail_y = _luma(retail_frame)
+            # Scene cuts only need a thumbnail; stretch the tiny luma image.
+            thumb = cv2.resize(retail_y, (64, 36), interpolation=cv2.INTER_AREA)
+            if detector.grey(cv2.LUT(thumb, _FULL_RANGE)) and index:
                 cuts.add(index)
             if index - chunk_start >= config.overlay_chunk:
                 _merge_overlays(overlays, chunk.finish(chunk_start, index, *alignment.retail_size, config), config)
@@ -350,8 +375,8 @@ def mosaic_regions_for_pair(alignment: Alignment, config: MaskConfig, *, progres
                     if leak_frame is None:
                         raise ValueError(f"leak ended before aligned frame {target}")
                     leak_index += 1
-                retail_grey = cv2.cvtColor(retail_frame, cv2.COLOR_RGB2GRAY)
-                leak_grey = cv2.cvtColor(leak_frame, cv2.COLOR_RGB2GRAY)
+                retail_grey = cv2.LUT(retail_y, _FULL_RANGE)
+                leak_grey = cv2.LUT(_luma(leak_frame), _FULL_RANGE)
                 areas, other, retail, leak = _analyse(retail_grey, leak_grey, config)
                 analysed += 1
                 chunk.add(other, retail, leak, config)
@@ -385,9 +410,9 @@ def mosaic_regions_for_pair(alignment: Alignment, config: MaskConfig, *, progres
     return result
 
 
-def _mask_in_worker(alignment_path: Path, output: Path, config: MaskConfig) -> dict:
+def _mask_in_worker(alignment_path: Path, output: Path, config: MaskConfig, decode_threads: int = 2) -> dict:
     cv2.setNumThreads(1)
-    regions = mosaic_regions_for_pair(load_alignment(alignment_path), config)
+    regions = mosaic_regions_for_pair(load_alignment(alignment_path), config, decode_threads=decode_threads)
     save_regions(regions, output, extra={"settings": {**asdict(config), "alignment": str(alignment_path)},
                                         "stats": regions.stats})
     return regions.stats
@@ -398,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--align-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--decode-threads", type=int, default=2, help="threads per video decoder (default: 2)")
     parser.add_argument("--stride", type=int, default=MaskConfig.stride)
     parser.add_argument("--scale", type=float, default=MaskConfig.scale)
     parser.add_argument("--overwrite", action="store_true")
@@ -407,6 +433,8 @@ def main(argv: list[str] | None = None) -> int:
         config = MaskConfig(stride=args.stride, scale=args.scale)
         if args.workers < 1:
             raise ValueError("workers must be positive")
+        if args.decode_threads < 1:
+            raise ValueError("--decode-threads must be positive")
     except ValueError as error:
         parser.error(str(error))
     paths = sorted(args.align_dir.glob("*.json"))
@@ -432,12 +460,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.workers == 1:
         for path in jobs:
             try:
-                report(path, _mask_in_worker(path, args.out / path.name, config))
+                report(path, _mask_in_worker(path, args.out / path.name, config, args.decode_threads))
             except Exception as error:  # noqa: BLE001 - keep processing other titles
                 report(path, error=error)
     else:
         with ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context("spawn")) as pool:
-            futures = {pool.submit(_mask_in_worker, path, args.out / path.name, config): path for path in jobs}
+            futures = {pool.submit(_mask_in_worker, path, args.out / path.name, config, args.decode_threads): path for path in jobs}
             for future in as_completed(futures):
                 try:
                     report(futures[future], future.result())

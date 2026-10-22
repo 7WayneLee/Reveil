@@ -176,8 +176,11 @@ class CutDetector:
         self._last: np.ndarray | None = None
 
     def __call__(self, frame: np.ndarray) -> bool:
-        grey = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        thumb = cv2.resize(grey, (64, 36), interpolation=cv2.INTER_AREA).astype(np.int16)
+        return self.grey(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY))
+
+    def grey(self, frame: np.ndarray) -> bool:
+        """Accept full-range grey input, including an already reduced thumbnail."""
+        thumb = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA).astype(np.int16)
         cut = self._last is not None and float(np.abs(thumb - self._last).mean()) > self.threshold
         self._last = thumb
         return cut

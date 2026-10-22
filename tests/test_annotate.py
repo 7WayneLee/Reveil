@@ -1,5 +1,6 @@
 import json
 
+import cv2
 import numpy as np
 import pytest
 
@@ -140,6 +141,18 @@ def test_cut_detector_flags_hard_cuts_only():
     frames = list(square_frames(20, cut_at=10))
     detect = CutDetector(30.0)
     assert [i for i, f in enumerate(frames) if detect(f)] == [10]
+
+
+def test_cut_detector_rgb_and_grey_agree():
+    frames = list(square_frames(20, cut_at=10))
+    rgb, grey, thumbnail = CutDetector(30), CutDetector(30), CutDetector(30)
+    full, small = [], []
+    for frame in frames:
+        y = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        full.append(grey.grey(y))
+        small.append(thumbnail.grey(cv2.resize(y, (64, 36), interpolation=cv2.INTER_AREA)))
+    assert [rgb(frame) for frame in frames] == full == small
+    assert np.flatnonzero(full).tolist() == [10]
 
 
 def test_tracks_fill_gaps_by_moving_regions_and_drop_short_ones():
