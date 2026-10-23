@@ -4,7 +4,9 @@ Composite targets preserve the retail pixels outside the real mosaic. Source vid
 are decoded once in forward order; active windows retain canvas-sized arrays.
 Only leak canvases needed by a future window are spooled to temporary disk.
 Composite targets match leak blur and previous-frame mixing to the retail and gate
-blend seams. Leak targets use colour fitting only, without blur, mixing or a seam gate.
+blend seams. Leak targets optionally match colours, without blur, mixing or a seam
+gate. With colour_fit=False, leak canvases pass through unchanged and composite
+quality matching uses identity colours; metadata records colour_fit as null.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ class RealPairConfig:
     feather_blocks: float = 0.25
     overlay_margin: float = 0.02
     colour_sample_frames: int = 8
+    colour_fit: bool = True
     match_quality: bool = True
     quality_tolerance: float = 0.03
     blur_sigmas: tuple[float, ...] = (0, 0.2, 0.4)
@@ -350,7 +353,9 @@ class _WindowBuffer:
         self.exclusions: dict[int, np.ndarray] = {}
         self.ring_pixels: dict[int, np.ndarray] = {}
         self.sample_masks: dict[int, np.ndarray] = {}
-        self.sample_indices = tuple(np.linspace(0, count - 1, min(config.colour_sample_frames, count), dtype=int))
+        needs_samples = config.colour_fit or (config.target == "composite" and config.match_quality)
+        self.sample_indices = (tuple(np.linspace(0, count - 1, min(config.colour_sample_frames, count), dtype=int))
+                               if needs_samples else ())
         self.spooled: dict[tuple[str, int], Path] = {}
         self.retail_count = 0
         self.leak_count = 0
@@ -441,8 +446,10 @@ class _WindowBuffer:
             return self.leak[index - 1]
         return self.previous[index]
 
-    def quality_fit(self, config: RealPairConfig) -> tuple[dict, dict]:
+    def quality_fit(self, config: RealPairConfig) -> tuple[dict | None, dict]:
         enabled = config.target == "composite" and config.match_quality
+        if not config.colour_fit and not enabled:
+            return None, {"sigma": 0.0, "prev_mix": 0.0, "residual": None, "identity_residual": None}
         samples, y = self._samples(border=enabled)
         fits, scores = {}, {}
         identity = None
@@ -459,7 +466,10 @@ class _WindowBuffer:
             x, p = np.concatenate(current), np.concatenate(previous)
             for mix in mixes:
                 candidate = (1 - mix) * x + mix * p if mix else x
-                fit, score = _fit_colour_scored(candidate, y)
+                if config.colour_fit:
+                    fit, score = _fit_colour_scored(candidate, y)
+                else:
+                    fit, score = None, float(np.abs(candidate - y).mean())
                 if sigma == 0 and mix == 0:
                     identity = score
                 if enabled and (sigma not in config.blur_sigmas or mix not in config.prev_mixes):
@@ -470,28 +480,28 @@ class _WindowBuffer:
         return fits[sigma, mix], {"sigma": sigma, "prev_mix": mix,
                                  "residual": scores[sigma, mix], "identity_residual": identity}
 
-    def _matched(self, index: int, quality: dict, gain: np.ndarray, offset: np.ndarray) -> np.ndarray:
+    def _matched(self, index: int, quality: dict, fit: dict | None) -> np.ndarray:
         image = _blur(self.leak[index], quality["sigma"])
         previous = self._previous(index)
         mix = quality["prev_mix"]
         if mix and previous is not None:
             image *= 1 - mix
             image += mix * _blur(previous, quality["sigma"])
-        image *= gain
-        image += offset
-        np.clip(image, 0, 255, out=image)
+        if fit is not None:
+            image *= np.asarray(fit["a"], np.float32)
+            image += np.asarray(fit["b"], np.float32)
+            np.clip(image, 0, 255, out=image)
         return image
 
-    def ring_score(self, quality: dict, fit: dict, alignment: Alignment,
+    def ring_score(self, quality: dict, fit: dict | None, alignment: Alignment,
                    config: RealPairConfig) -> tuple[dict, dict]:
         residuals = []
         shares = []
-        gain, offset = np.asarray(fit["a"], np.float32), np.asarray(fit["b"], np.float32)
         blocks = [_block(r, max(alignment.retail_size)) for items in self.plan.regions for r in items]
         source_block = float(np.median(blocks)) if blocks else 0.015 * max(alignment.retail_size)
         indices = range(len(self.plan.crops)) if config.target == "composite" else ()
         for index in indices:
-            image = self._matched(index, quality, gain, offset)
+            image = self._matched(index, quality, fit)
             pixels = self.ring_pixels.get(index, np.empty(0, dtype=int))
             share = 0.0
             if config.redetect:
@@ -528,14 +538,24 @@ class _WindowBuffer:
 
     def finish(self, title: str, alignment: Alignment, out_dir: Path, config: RealPairConfig) -> dict:
         plan = self.plan
-        fit, quality = self.quality_fit(config)
-        ring, redetect = self.ring_score(quality, fit, alignment, config)
-        gain, offset = np.asarray(fit["a"], np.float32), np.asarray(fit["b"], np.float32)
+        plain_leak = config.target == "leak" and not config.colour_fit
+        if plain_leak:
+            fit = None
+            quality = {"sigma": 0.0, "prev_mix": 0.0, "residual": None, "identity_residual": None}
+        else:
+            fit, quality = self.quality_fit(config)
+        if config.target == "composite":
+            ring, redetect = self.ring_score(quality, fit, alignment, config)
+        else:
+            ring = {"score": None, "median": None, "max": None, "frames": 0}
+            redetect = {"added_share_mean": 0.0, "added_share_max": 0.0}
 
         def canvases(target: bool):
             for index in range(len(plan.crops)):
-                if target:
-                    image = self._matched(index, quality, gain, offset)
+                if target and plain_leak:
+                    image = self.leak[index]
+                elif target:
+                    image = self._matched(index, quality, fit)
                     if config.target == "composite":
                         alpha = self.alpha[index]
                         retail = self.retail[index]
@@ -705,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, help="YAML overrides: pairs / camera sections")
     parser.add_argument("--target", choices=("composite", "leak"))
     parser.add_argument("--max-windows-per-title", type=int)
+    parser.add_argument("--no-colour-fit", action="store_true", help="preserve leak colours without gain or offset")
     parser.add_argument("--no-match-quality", action="store_true", help="disable composite blur and temporal matching")
     parser.add_argument("--ring-max-residual", type=float, help="maximum seam-ring residual in grey levels; 0 disables (default: 6)")
     parser.add_argument("--candidate-factor", type=float, help="candidate windows per capped output window (default: 1.5)")
@@ -719,6 +740,8 @@ def main(argv: list[str] | None = None) -> int:
                  if getattr(args, name) is not None}
     if args.no_match_quality:
         overrides["match_quality"] = False
+    if args.no_colour_fit:
+        overrides["colour_fit"] = False
     config = replace(config, **overrides)
     if args.workers < 1:
         parser.error("--workers must be positive")

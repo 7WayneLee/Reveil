@@ -226,6 +226,70 @@ def test_leak_targets_skip_logo_crops(real_pair):
             assert np.abs(frame.astype(float) - expected).mean() < 2
 
 
+def test_plain_leak_preserves_both_source_canvases_and_skips_matching(real_pair, tmp_path, monkeypatch):
+    import reveil.real_pairs as module
+
+    data = real_pair
+    config = replace(data["config"], target="leak", colour_fit=False, match_quality=True,
+                     max_windows_per_title=2)
+    plans = {p.key: p for p in _plans(data, config)}
+    assert plans and all(p.previous_leak_index is None for p in plans.values())
+    encode = module.write_video
+
+    def checked_encode(path, images, fps, **options):
+        plan = plans[path.stem]
+        target = path.parent.name == "clean"
+
+        def checked_canvases():
+            for index, image in enumerate(images):
+                source = (data["leak"][plan.leak_indices[index]] if target
+                          else data["retail"][plan.start + index])
+                np.testing.assert_array_equal(image, crop_to_canvas(source, plan.crops[index]))
+                yield image
+
+        return encode(path, checked_canvases(), fps, **options)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("plain leak windows must skip masks, colour/quality fitting and composite work")
+
+    for name in ("_masks", "_ring_mask", "_fit_colour", "_fit_colour_scored", "_blur", "_redetect"):
+        monkeypatch.setattr(module, name, unexpected)
+    for name in ("_samples", "quality_fit", "ring_score", "_matched"):
+        monkeypatch.setattr(module._WindowBuffer, name, unexpected)
+    monkeypatch.setattr(module, "write_video", checked_encode)
+    out = tmp_path / "plain"
+    rows = _build(data, out, config)
+    assert len(rows) == 2
+    assert json.loads((out / "meta/TITLE.json").read_text())["windows"] == rows
+    for row in rows:
+        plan = plans[row["key"]]
+        assert row["colour_fit"] is None
+        assert row["quality"] == {"sigma": 0, "prev_mix": 0, "residual": None, "identity_residual": None}
+        assert row["ring"] == {"score": None, "median": None, "max": None, "frames": 0}
+        assert row["redetect"] == {"added_share_mean": 0, "added_share_max": 0}
+        targets = list(read_frames(out / row["video"]))
+        references = list(read_frames(out / row["reference_video"]))
+        assert len(targets) == len(references) == config.window
+        assert row["crops"] == [list(c.box) for c in plan.crops]
+        for index, (target, reference, crop) in enumerate(zip(targets, references, plan.crops)):
+            expected_target = crop_to_canvas(data["leak"][plan.leak_indices[index]], crop)
+            expected_reference = crop_to_canvas(data["retail"][plan.start + index], crop)
+            assert np.abs(target.astype(float) - expected_target).mean() < 2
+            assert np.abs(reference.astype(float) - expected_reference).mean() < 2
+
+
+@pytest.mark.parametrize("side", ["retail", "leak"])
+def test_plain_leak_still_drops_views_touching_active_overlays(real_pair, side):
+    data = real_pair
+    config = replace(data["config"], target="leak", colour_fit=False)
+    plans = _plans(data, config)
+    assert [p.key for p in plans] == [p.key for p in _plans(data, replace(config, colour_fit=True))]
+    overlay = Overlay((0, 0, 320, 180), side, 1, (100, 150))
+    regions = replace(data["regions"], overlays=(overlay,))
+    plans = plan_real_windows(data["alignment"], regions, "TITLE", config, np.random.default_rng(0))
+    assert plans and all(p.start + config.window <= 100 or p.start >= 150 for p in plans)
+
+
 def test_planning_gaps_cuts_overlays_and_seed(real_pair):
     data = real_pair
     alignment, regions, config = data["alignment"], data["regions"], data["config"]
@@ -286,6 +350,25 @@ def test_cli_spawn_config_and_only_filter(real_pair, tmp_path, capsys):
         load_config(config_path)
 
 
+@pytest.mark.parametrize("setting", ["cli", "yaml"])
+def test_cli_and_yaml_disable_colour_fit(real_pair, tmp_path, setting):
+    data = real_pair
+    config_path = tmp_path / "plain.yaml"
+    config_path.write_text("pairs:\n  window: 3\n  hop: 121\n  target: leak\n"
+                           f"  colour_fit: {'true' if setting == 'cli' else 'false'}\n"
+                           "camera:\n  canvas: 128\n")
+    assert load_config(config_path).colour_fit == (setting == "cli")
+    out = tmp_path / setting
+    args = ["--align-dir", str(data["alignment_path"].parent),
+            "--regions-dir", str(data["regions_path"].parent), "--out", str(out),
+            "--config", str(config_path), "--workers", "1", "--max-windows-per-title", "1"]
+    if setting == "cli":
+        args.append("--no-colour-fit")
+    assert main(args) == 0
+    row, = json.loads((out / "meta/TITLE.json").read_text())["windows"]
+    assert row["target"] == "leak" and row["colour_fit"] is None
+
+
 def test_cli_resumes_prepared_pairs_with_missing_source_videos(tmp_path, capsys):
     title = "TITLE (prepared)"
     align_dir, regions_dir, out = tmp_path / "align", tmp_path / "regions", tmp_path / "data"
@@ -318,7 +401,8 @@ def test_cli_resumes_prepared_pairs_with_missing_source_videos(tmp_path, capsys)
         main(args)
 
 
-def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, monkeypatch):
+@pytest.mark.parametrize("colour_fit", [False, True])
+def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, monkeypatch, colour_fit):
     # Exercise scale and reordered leak shots without another encode/decode cycle.
     # All frame arrays come from the generated fixture, never real footage.
     import reveil.real_pairs as module
@@ -348,14 +432,19 @@ def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, 
 
     monkeypatch.setattr(module, "decoded_frames", fake_decode)
     monkeypatch.setattr(module, "write_video", capture)
-    config = replace(data["config"], target="leak", max_windows_per_title=2, colour_sample_frames=2)
+    config = replace(data["config"], target="leak", max_windows_per_title=2,
+                     colour_sample_frames=2, colour_fit=colour_fit)
     out = tmp_path / "out"
     rows = build_title_pairs("TITLE", alignment_path, regions_path, out, config, decode_threads=3)
     assert len(rows) == 2
     assert any(np.any(np.diff(row["leak_indices"]) < 0) for row in rows)
     assert calls == [(alignment.retail, 3), (alignment.leak, 3)]
     for row in rows:
-        gain, offset = np.array(row["colour_fit"]["a"]), np.array(row["colour_fit"]["b"])
+        if colour_fit:
+            gain, offset = np.array(row["colour_fit"]["a"]), np.array(row["colour_fit"]["b"])
+        else:
+            assert row["colour_fit"] is None
+            gain, offset = 1, 0
         # Tight views retain fine chroma that is lost to 4:2:0 even at CRF zero;
         # verify the mapping before coding while still exercising MP4 output.
         assert probe(out / row["video"]).frames == config.window
@@ -479,6 +568,50 @@ def test_quality_recovers_blur_mix_and_records_meta(tmp_path, monkeypatch):
         "video": row["video"], "reference_video": row["reference_video"], "caption": "caption",
     }
     assert data["calls"] == [data["alignment"].retail, data["alignment"].leak]
+
+
+@pytest.mark.parametrize("match_quality", [False, True])
+@pytest.mark.parametrize("colour", [False, True])
+def test_composite_without_colour_fit_uses_identity_colours(tmp_path, monkeypatch, match_quality, colour):
+    import reveil.real_pairs as module
+
+    data = _quality_pair(tmp_path, monkeypatch, colour=colour)
+    config = replace(data["config"], colour_fit=False, match_quality=match_quality,
+                     redetect=False, ring_max_residual=0)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("disabled colour fitting must not run a regression")
+
+    monkeypatch.setattr(module, "_fit_colour", unexpected)
+    monkeypatch.setattr(module, "_fit_colour_scored", unexpected)
+    if not match_quality:
+        monkeypatch.setattr(module._WindowBuffer, "_samples", unexpected)
+    out = tmp_path / "identity-colours"
+    row, = _build(data, out, config)
+    assert row["colour_fit"] is None
+    assert row["quality"]["sigma"] == (1 if match_quality else 0)
+    assert row["quality"]["prev_mix"] == (0.2 if match_quality else 0)
+    if match_quality:
+        assert row["quality"]["residual"] < row["quality"]["identity_residual"] / 10
+    else:
+        assert row["quality"]["residual"] is row["quality"]["identity_residual"] is None
+    assert row["ring"]["frames"] == config.window
+    plan, = _plans(data, config)
+    expected = []
+    for index, crop in enumerate(plan.crops):
+        image = crop_to_canvas(data["leak"][plan.leak_indices[index]], crop).astype(np.float32)
+        if match_quality:
+            image = cv2.GaussianBlur(image, (0, 0), sigmaX=1)
+            previous_index = plan.previous_leak_index if index == 0 else plan.leak_indices[index - 1]
+            if previous_index is not None:
+                previous = crop_to_canvas(data["leak"][previous_index], crop).astype(np.float32)
+                image = 0.8 * image + 0.2 * cv2.GaussianBlur(previous, (0, 0), sigmaX=1)
+        _, alpha = _masks(plan.regions[index], plan.work, 96, config)
+        alpha = crop_to_canvas(np.repeat(alpha[..., None], 3, axis=2), crop)[..., 0, None]
+        retail = crop_to_canvas(data["retail"][plan.start + index], crop)
+        expected.append(np.rint(retail * (1 - alpha) + image * alpha).clip(0, 255).astype(np.uint8))
+    assert np.abs(data["written"][out / row["video"]].astype(float) - np.stack(expected)).mean() < 0.01
+    np.testing.assert_array_equal(data["written"][out / row["reference_video"]], data["retail"][plan.start:])
 
 
 def test_no_quality_matching_is_byte_identical_to_legacy(tmp_path, monkeypatch):
@@ -653,7 +786,8 @@ def test_quality_config_yaml_and_cli_flags(tmp_path, capsys):
         main(["--help"])
     assert result.value.code == 0
     help_text = capsys.readouterr().out
-    assert all(flag in help_text for flag in ("--no-match-quality", "--ring-max-residual", "--candidate-factor"))
+    assert all(flag in help_text for flag in ("--no-colour-fit", "--no-match-quality",
+                                             "--ring-max-residual", "--candidate-factor"))
 
 
 def test_quality_and_ring_exclude_border_and_active_overlay(tmp_path, monkeypatch):
@@ -753,6 +887,7 @@ def test_legacy_encoded_fixture_prefers_identity_with_default_tolerance(real_pai
 
 def test_real_pair_defaults_and_yaml_for_tight_views_and_redetection(tmp_path):
     config = RealPairConfig()
+    assert config.colour_fit
     assert config.mask_grow_blocks == 1 and config.feather_blocks == 0.25
     assert config.blur_sigmas == (0, 0.2, 0.4)
     assert config.prev_mixes == (0, 0.1, 0.2, 0.3, 0.4) and config.quality_tolerance == 0.03
@@ -848,17 +983,20 @@ def _missed_pair(tmp_path, monkeypatch, *, missed=True, overlay_side=None):
             "regions": regions, "config": config, "retail": retail, "leak": leak, "written": written}
 
 
-def test_redetection_replaces_missed_pixelation_and_keeps_region_only_fit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("colour_fit", [False, True])
+def test_redetection_replaces_missed_pixelation_and_keeps_region_only_fit(tmp_path, monkeypatch, colour_fit):
     data = _missed_pair(tmp_path, monkeypatch)
+    config = replace(data["config"], colour_fit=colour_fit)
     out = tmp_path / "out"
-    row, = _build(data, out)
+    row, = _build(data, out, config)
+    assert (row["colour_fit"] is not None) == colour_fit
     assert row["canvas"] == 192
     assert 0 < row["redetect"]["added_share_mean"] <= row["redetect"]["added_share_max"]
     assert row["ring"]["score"] < 1e-4
     actual = data["written"][out / row["video"]]
     error = np.abs(actual[:, 64:112, 120:160].astype(float) - data["leak"][64:112, 120:160])
     assert error.max() <= 1 and error.mean() < 0.01  # feathered outer corner only
-    off, = _build(data, tmp_path / "off", replace(data["config"], redetect=False))
+    off, = _build(data, tmp_path / "off", replace(config, redetect=False))
     assert off["redetect"] == {"added_share_mean": 0, "added_share_max": 0}
     assert off["colour_fit"] == row["colour_fit"] and off["quality"] == row["quality"]
     unchanged = data["written"][tmp_path / "off" / off["video"]]
