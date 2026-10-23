@@ -330,6 +330,13 @@ def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, 
     regions_path = tmp_path / "regions.json"
     save_regions(replace(data["regions"], overlays=()), regions_path)
     calls = []
+    rendered = {}
+    encode = module.write_video
+
+    def capture(path, images, fps, **options):
+        frames = list(images)
+        rendered[path] = frames
+        return encode(path, frames, fps, **options)
 
     def fake_decode(path, *, threads=None):
         calls.append((path, threads))
@@ -340,6 +347,7 @@ def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, 
                 yield _RGBFrame(cv2.resize(frame, (640, 360), interpolation=cv2.INTER_NEAREST))
 
     monkeypatch.setattr(module, "decoded_frames", fake_decode)
+    monkeypatch.setattr(module, "write_video", capture)
     config = replace(data["config"], target="leak", max_windows_per_title=2, colour_sample_frames=2)
     out = tmp_path / "out"
     rows = build_title_pairs("TITLE", alignment_path, regions_path, out, config, decode_threads=3)
@@ -348,11 +356,14 @@ def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, 
     assert calls == [(alignment.retail, 3), (alignment.leak, 3)]
     for row in rows:
         gain, offset = np.array(row["colour_fit"]["a"]), np.array(row["colour_fit"]["b"])
-        for index, target in enumerate(read_frames(out / row["video"])):
+        # Tight views retain fine chroma that is lost to 4:2:0 even at CRF zero;
+        # verify the mapping before coding while still exercising MP4 output.
+        assert probe(out / row["video"]).frames == config.window
+        for index, target in enumerate(rendered[out / row["video"]]):
             crop = CropFrame(tuple(row["crops"][index]), 128)
             leak = crop_to_canvas(data["leak"][row["leak_indices"][index]], crop)
             expected = np.rint(leak * gain + offset).clip(0, 255)
-            assert np.abs(target.astype(float) - expected).mean() < 2
+            assert np.abs(target.astype(float) - expected).mean() < 0.01
 
 
 def _quality_pair(tmp_path, monkeypatch, *, count=10, indices=None, start=1,
@@ -414,6 +425,7 @@ def _quality_pair(tmp_path, monkeypatch, *, count=10, indices=None, start=1,
     monkeypatch.setattr(module, "decoded_frames", decode)
     monkeypatch.setattr(module, "write_video", encode)
     config = RealPairConfig(window=count - start, hop=count - start, colour_sample_frames=5,
+                            blur_sigmas=(0, 0.2, 0.4, 1.0),  # exercise configurable sigma-1 matching
                             camera=CameraConfig(canvas=size, context=size))
     return {"root": tmp_path, "alignment": alignment, "regions": regions,
             "alignment_path": alignment_path, "regions_path": regions_path,
@@ -572,7 +584,10 @@ def test_previous_frame_follows_retail_mapping_and_current_crop(tmp_path, monkey
     if mapping == "moving-crop":
         monkeypatch.setattr(module, "plan_crops", lambda boxes, *args: [
             CropFrame((16 + i % 3, 16, 80 + i % 3, 80), 64) for i in range(len(boxes))])
-    config = replace(data["config"], blur_sigmas=(0,))
+    # Keep the mocked 64px views moving rather than growing them to a 96px
+    # full-frame view under the new no-upscaling rule.
+    camera = replace(data["config"].camera, canvas=64) if mapping == "moving-crop" else data["config"].camera
+    config = replace(data["config"], blur_sigmas=(0,), camera=camera)
     plan, = _plans(data, config)
     if mapping == "unmatched":
         assert plan.previous_leak_index is None
@@ -643,14 +658,14 @@ def test_quality_config_yaml_and_cli_flags(tmp_path, capsys):
 
 def test_quality_and_ring_exclude_border_and_active_overlay(tmp_path, monkeypatch):
     data = _quality_pair(tmp_path, monkeypatch)
-    overlay = Overlay((21, 34, 25, 62), "retail", 1.0, (3, 6))
+    overlay = Overlay((17, 34, 21, 62), "retail", 1.0, (3, 6))
     regions = replace(data["regions"], overlays=(overlay,))
     save_regions(regions, data["regions_path"])
     for index, frame in enumerate(data["retail"]):
         frame[:4] = frame[-4:] = 0
         frame[:, :4] = frame[:, -4:] = 0
         if overlay.active(index):
-            frame[34:62, 21:25] = (255, 0, 255)
+            frame[34:62, 17:21] = (255, 0, 255)
     row, = _build(data, tmp_path / "out")
     assert row["quality"]["sigma"] == 1
     assert row["quality"]["prev_mix"] == 0.2
@@ -675,8 +690,8 @@ def test_ring_uses_each_regions_block_and_excludes_all_grown_masks(tmp_path):
     assert not (ring & grown).any()
     assert not ring[:4].any() and not ring[-4:].any()
     assert not ring[:, :4].any() and not ring[:, -4:].any()
-    assert ring[40, 77] and not ring[40, 79]  # second region: 6 growth + 12 ring
-    assert ring[75, 12] and not ring[77, 12]  # first region: 4 growth + 8 ring
+    assert ring[40, 83] and not ring[40, 85]  # second region: 12 growth + 12 ring
+    assert ring[79, 12] and not ring[81, 12]  # first region: 8 growth + 8 ring
 
 
 def test_forward_spool_keeps_previous_canvases_for_future_moving_crops(tmp_path, monkeypatch):
@@ -686,7 +701,8 @@ def test_forward_spool_keeps_previous_canvases_for_future_moving_crops(tmp_path,
     data = _quality_pair(tmp_path, monkeypatch, count=19, indices=indices, sigma=0, colour=False)
     monkeypatch.setattr(module, "plan_crops", lambda boxes, *args: [
         CropFrame((16 + i % 3, 16, 80 + i % 3, 80), 64) for i in range(len(boxes))])
-    config = replace(data["config"], window=5, hop=5, blur_sigmas=(0,))
+    config = replace(data["config"], window=5, hop=5, blur_sigmas=(0,),
+                     camera=replace(data["config"].camera, canvas=64))
     rows = _build(data, tmp_path / "out", config)
     assert len(rows) >= 2
     assert all(row["quality"]["prev_mix"] == 0.2 for row in rows)
@@ -733,3 +749,196 @@ def test_legacy_encoded_fixture_prefers_identity_with_default_tolerance(real_pai
     for row in rows:
         assert row["quality"]["sigma"] == row["quality"]["prev_mix"] == 0
         assert row["quality"]["residual"] == row["quality"]["identity_residual"]
+
+
+def test_real_pair_defaults_and_yaml_for_tight_views_and_redetection(tmp_path):
+    config = RealPairConfig()
+    assert config.mask_grow_blocks == 1 and config.feather_blocks == 0.25
+    assert config.blur_sigmas == (0, 0.2, 0.4)
+    assert config.prev_mixes == (0, 0.1, 0.2, 0.3, 0.4) and config.quality_tolerance == 0.03
+    assert config.redetect and config.redetect_min_diff == 12 and config.redetect_max_std == 3
+    assert config.camera.canvas == 512 and config.camera.large_canvas == 768
+    assert config.camera.large_min_side == 640
+    assert config.camera.border_fraction == 0.06 and config.camera.min_border == 20
+    path = tmp_path / "tight.yaml"
+    path.write_text("pairs:\n  redetect: false\n  redetect_min_diff: 15\n  redetect_max_std: 2\n"
+                    "camera:\n  canvas: 256\n  large_canvas: 512\n  large_min_side: 400\n"
+                    "  min_border: 12\n  border_fraction: 0.04\n")
+    custom = load_config(path)
+    assert not custom.redetect and custom.redetect_min_diff == 15 and custom.redetect_max_std == 2
+    assert custom.camera.canvas == 256 and custom.camera.large_canvas == 512
+    assert custom.camera.large_min_side == 400 and custom.camera.min_border == 12
+    assert custom.camera.border_fraction == 0.04
+
+
+def test_odd_frame_masks_include_other_tracks_and_do_not_cross_cuts():
+    first = Region((150, 150, 210, 210), block=8)
+    other = Region((260, 150, 320, 210), block=8)
+    future = Region((400, 150, 460, 210), block=8)
+    regions = RegionSet({0: [first, other], 2: [first, other], 4: [first, future]}, frozenset({4}))
+    alignment = Alignment("retail", "leak", 5, 5, 24, 24, (640, 640), (640, 640), ((0, 0, 5),))
+    config = RealPairConfig(window=3, hop=3)
+    plans = plan_real_windows(alignment, regions, "odd", config, np.random.default_rng(0))
+    assert len(plans) == 2
+    for plan in plans:
+        mask, _ = _masks(plan.regions[1], (0, 0, 640, 640), 640, config, feather=False)
+        assert mask[180, 180] and mask[180, 290]
+        assert not mask[180, 430]
+    # At frame 3 the next analysed frame is a new scene: use frame 2 even
+    # though frame 4 is equally near, and never borrow that scene's future area.
+    from reveil.tracks import Track
+    import reveil.real_pairs as module
+    # The last gap is not normally emitted by build_tracks, so make that boundary
+    # explicit without reading or decoding any footage.
+    from unittest.mock import patch
+    with patch.object(module, "build_tracks", return_value=[Track(3, [first.box], [[first]])]):
+        plan, = plan_real_windows(alignment, regions, "cut", replace(config, window=1), np.random.default_rng(0))
+    mask, _ = _masks(plan.regions[0], (0, 0, 640, 640), 640, config, feather=False)
+    assert mask[180, 290] and not mask[180, 430]
+
+
+def test_gap_view_contains_bordered_regions_even_when_track_box_is_interpolated():
+    first = Region((100, 100, 600, 600), block=16)
+    later = Region((500, 100, 1000, 600), block=16)
+    regions = RegionSet({0: [first], 2: [later]})
+    alignment = Alignment("retail", "leak", 3, 3, 24, 24, (1920, 1080), (1920, 1080), ((0, 0, 3),))
+    plan, = plan_real_windows(alignment, regions, "gap", RealPairConfig(window=3), np.random.default_rng(0))
+    assert plan.boxes[1] == first.box
+    x0, y0, x1, y1 = plan.crops[1].box
+    assert x0 <= 70 and y0 <= 70 and x1 >= 630 and y1 >= 630
+
+
+def _missed_pair(tmp_path, monkeypatch, *, missed=True, overlay_side=None):
+    """Two synthetic pixelated patches, one absent from the regions file."""
+    import reveil.real_pairs as module
+
+    size, count = 192, 3
+    y, x = np.indices((size, size))
+    grey = np.where((x + y) % 2, 220, 30).astype(np.uint8)
+    leak = np.repeat(grey[..., None], 3, axis=2)
+    retail = leak.copy()
+    region = Region((48, 72, 80, 104), block=8)
+    retail[72:104, 48:80] = 125
+    if missed:
+        retail[64:112, 120:160] = 125
+    if overlay_side:
+        retail[64:112, 120:160] = 125
+        leak[64:112, 120:160] = 240 if overlay_side == "leak" else 30
+    overlays = (Overlay((120, 64, 160, 112), overlay_side, 1, (0, 1)),) if overlay_side else ()
+    regions = RegionSet({i: [region] for i in range(count)}, overlays=overlays)
+    alignment = Alignment(str(tmp_path / "retail.mp4"), str(tmp_path / "leak.mp4"), count, count,
+                          24, 24, (size, size), (size, size), ((0, 0, count),))
+    align_path, regions_path = tmp_path / "align.json", tmp_path / "regions.json"
+    save_alignment(alignment, align_path)
+    save_regions(regions, regions_path)
+    written = {}
+
+    def decode(path, *, threads=None):
+        yield from (_RGBFrame(retail if path == alignment.retail else leak) for _ in range(count))
+
+    def encode(path, images, fps, *, crf):
+        written[path] = np.stack(list(images))
+        path.write_bytes(written[path].tobytes())
+
+    monkeypatch.setattr(module, "decoded_frames", decode)
+    monkeypatch.setattr(module, "write_video", encode)
+    config = RealPairConfig(window=count, hop=count, match_quality=False,
+                            camera=CameraConfig(canvas=size), overlay_margin=0)
+    return {"alignment": alignment, "alignment_path": align_path, "regions_path": regions_path,
+            "regions": regions, "config": config, "retail": retail, "leak": leak, "written": written}
+
+
+def test_redetection_replaces_missed_pixelation_and_keeps_region_only_fit(tmp_path, monkeypatch):
+    data = _missed_pair(tmp_path, monkeypatch)
+    out = tmp_path / "out"
+    row, = _build(data, out)
+    assert row["canvas"] == 192
+    assert 0 < row["redetect"]["added_share_mean"] <= row["redetect"]["added_share_max"]
+    assert row["ring"]["score"] < 1e-4
+    actual = data["written"][out / row["video"]]
+    error = np.abs(actual[:, 64:112, 120:160].astype(float) - data["leak"][64:112, 120:160])
+    assert error.max() <= 1 and error.mean() < 0.01  # feathered outer corner only
+    off, = _build(data, tmp_path / "off", replace(data["config"], redetect=False))
+    assert off["redetect"] == {"added_share_mean": 0, "added_share_max": 0}
+    assert off["colour_fit"] == row["colour_fit"] and off["quality"] == row["quality"]
+    unchanged = data["written"][tmp_path / "off" / off["video"]]
+    assert np.abs(unchanged[:, 70:106, 126:154].astype(float) - actual[:, 70:106, 126:154]).mean() > 50
+
+
+def test_redetection_adds_nothing_when_all_pixelation_is_in_regions(tmp_path, monkeypatch):
+    data = _missed_pair(tmp_path, monkeypatch, missed=False)
+    row, = _build(data, tmp_path / "out")
+    assert row["redetect"] == {"added_share_mean": 0, "added_share_max": 0}
+
+
+@pytest.mark.parametrize("side", ["retail", "leak"])
+def test_redetection_excludes_active_overlays_of_either_side(tmp_path, monkeypatch, side):
+    data = _missed_pair(tmp_path, monkeypatch, overlay_side=side)
+    row, = _build(data, tmp_path / "out")
+    actual = data["written"][tmp_path / "out" / row["video"]]
+    # The overlay is active only on frame zero: later frames deliberately prove
+    # that exclusion follows its active range rather than excluding it forever.
+    np.testing.assert_array_equal(actual[0, 64:112, 120:160], data["retail"][64:112, 120:160])
+    assert row["redetect"]["added_share_max"] > row["redetect"]["added_share_mean"] > 0
+
+
+def test_redetection_ignores_small_components_and_canvas_border():
+    from reveil.real_pairs import _redetect, _exclude_border
+
+    retail = np.full((96, 96, 3), 125, np.uint8)
+    leak = retail.copy()
+    leak[1:3, :] = 240
+    leak[46:48, 46:48] = 240
+    excluded = np.zeros((96, 96), bool)
+    _exclude_border(excluded)
+    assert not _redetect(retail, leak, 8, excluded, RealPairConfig()).any()
+
+
+def test_planned_custom_canvas_is_shared_and_recorded(tmp_path, monkeypatch):
+    data = _missed_pair(tmp_path, monkeypatch, missed=False)
+    camera = replace(data["config"].camera, canvas=128, large_canvas=160, large_min_side=127)
+    config = replace(data["config"], camera=camera)
+    row, = _build(data, tmp_path / "out", config)
+    assert row["canvas"] == 160
+    assert data["written"][tmp_path / "out" / row["video"]].shape == (3, 160, 160, 3)
+
+
+def test_seam_gate_measures_ring_around_redetected_area(tmp_path, monkeypatch):
+    import reveil.real_pairs as module
+
+    data = _missed_pair(tmp_path, monkeypatch)
+    original = module._redetect
+
+    def marked_patch(*args):
+        detected = original(*args)
+        # Add a mismatch immediately outside the new seam, far from the known
+        # region's ring. It must enter the score for the final union mask.
+        retail, matched = args[:2]
+        matched[44:64, 120:160] = retail[44:64, 120:160] * 0.0
+        return detected
+
+    monkeypatch.setattr(module, "_redetect", marked_patch)
+    row, = _build(data, tmp_path / "out", replace(data["config"], ring_max_residual=0))
+    assert row["ring"]["score"] > 1
+    assert row["redetect"]["added_share_mean"] > 0
+
+
+def test_redetection_without_regions_uses_fallback_block(tmp_path, monkeypatch):
+    import reveil.real_pairs as module
+
+    data = _missed_pair(tmp_path, monkeypatch)
+    config = data["config"]
+    crop = CropFrame((0, 0, 192, 192), 192)
+    plan = module.RealWindowPlan("fallback", 0, 0, [crop.box], [[]], [crop], crop.box, (0,))
+    buffer = module._WindowBuffer(plan, tmp_path, config)
+    buffer.activate()
+    for side in ("retail", "leak"):
+        buffer.add(side, 0, data[side], data["alignment"], RegionSet(), config)
+    out = tmp_path / "fallback"
+    for name in ("clean", "mosaic"):
+        (out / name).mkdir(parents=True)
+    row = buffer.finish("TITLE", data["alignment"], out, config)
+    assert row["redetect"]["added_share_mean"] > 0
+    restored = data["written"][out / row["video"]][0]
+    error = np.abs(restored[70:106, 126:154].astype(float) - data["leak"][70:106, 126:154])
+    assert error.max() == 0

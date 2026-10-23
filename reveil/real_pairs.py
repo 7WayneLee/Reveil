@@ -16,10 +16,11 @@ import multiprocessing
 import os
 import sys
 import tempfile
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import closing
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 # Each title has its own process; small dot products must not spin up BLAS pools.
@@ -30,11 +31,14 @@ import cv2
 import numpy as np
 import yaml
 
-from reveil.camera import CameraConfig, CropFrame, crop_to_canvas, plan_crops
+from reveil.camera import (
+    CameraConfig, CropFrame, RealCameraConfig, crop_to_canvas,
+    plan_tight_crops as plan_crops, real_window_canvas,
+)
 from reveil.frame_map import Alignment, load_alignment
 from reveil.mosaic import grow
 from reveil.pairs import DEFAULT_CAPTION, _clipped, _seed_for, _work_area, _write_atomic, rebuild_dataset, safe_stem
-from reveil.regions import Box, Region, RegionSet, clip_box, load_regions, rasterize
+from reveil.regions import Box, Region, RegionSet, clip_box, load_regions, rasterize, union_box
 from reveil.tracks import build_tracks, window_starts
 from reveil.video import VideoInfo, decoded_frames, write_video
 
@@ -48,21 +52,27 @@ class RealPairConfig:
     caption: str = DEFAULT_CAPTION
     output_crf: int = 10
     target: str = "composite"
-    mask_grow_blocks: float = 0.5
+    mask_grow_blocks: float = 1.0
     feather_blocks: float = 0.25
     overlay_margin: float = 0.02
     colour_sample_frames: int = 8
     match_quality: bool = True
     quality_tolerance: float = 0.03
-    blur_sigmas: tuple[float, ...] = (0, 0.4, 0.7, 1.0, 1.4, 1.8, 2.4, 3.0)
+    blur_sigmas: tuple[float, ...] = (0, 0.2, 0.4)
     prev_mixes: tuple[float, ...] = (0, 0.1, 0.2, 0.3, 0.4)
     ring_blocks: float = 1.0
     min_ring_pixels: int = 256
     ring_max_residual: float | None = 6.0
     candidate_factor: float = 1.5
-    camera: CameraConfig = field(default_factory=CameraConfig)
+    redetect: bool = True
+    redetect_min_diff: float = 12
+    redetect_max_std: float = 3
+    camera: RealCameraConfig = field(default_factory=RealCameraConfig)
 
     def __post_init__(self) -> None:
+        # Existing callers may still supply the shared synthetic camera config.
+        if isinstance(self.camera, CameraConfig) and not isinstance(self.camera, RealCameraConfig):
+            object.__setattr__(self, "camera", RealCameraConfig(**asdict(self.camera)))
         if self.target not in {"composite", "leak"}:
             raise ValueError("target must be 'composite' or 'leak'")
         if self.window < 1 or self.hop < 1 or self.fps <= 0 or self.colour_sample_frames < 1:
@@ -84,6 +94,13 @@ class RealPairConfig:
             raise ValueError("ring_max_residual must be None or finite and non-negative")
         if not math.isfinite(self.candidate_factor) or self.candidate_factor <= 0:
             raise ValueError("candidate_factor must be finite and positive")
+        if any(not math.isfinite(v) or v < 0 for v in (self.redetect_min_diff, self.redetect_max_std)):
+            raise ValueError("redetect thresholds must be finite and non-negative")
+        if min(self.camera.canvas, self.camera.large_canvas) < 1 or any(
+            not math.isfinite(v) or v < 0 for v in
+            (self.camera.border_fraction, self.camera.min_border, self.camera.large_min_side)
+        ):
+            raise ValueError("camera canvases must be positive and borders and threshold non-negative")
 
 
 @dataclass
@@ -184,20 +201,34 @@ def plan_real_windows(
     plans = []
     long_side = max(width, height)
     margin = config.overlay_margin * long_side
+    analysed = sorted(clipped.frames)
+    cuts = sorted(clipped.cuts)
+
+    def all_regions(index: int, own: list[Region]) -> list[Region]:
+        if index in clipped.frames:
+            return clipped.frames[index]
+        pos = bisect_left(analysed, index)
+        scene = bisect_right(cuts, index)
+        neighbors = [i for i in analysed[max(0, pos - 1):pos + 1] if bisect_right(cuts, i) == scene]
+        nearest = min(neighbors, key=lambda i: (abs(i - index), i)) if neighbors else None
+        items = clipped.frames[nearest] if nearest is not None else []
+        return items + [r for r in own if all(r is not other for other in items)]
+
     for number, track in enumerate(build_tracks(clipped)):
         length = len(track.boxes)
         if length < config.window:
             continue
-        crops = plan_crops(track.boxes, width, height, info.fps, config.camera)
+        boxes = [union_box(items) for items in track.regions]
+        crops = plan_crops(boxes, width, height, info.fps, config.camera)
         offset = int(rng.integers(0, min(config.hop, length - config.window) + 1))
         for first in window_starts(length, config.window, config.hop, offset):
             start, stop = track.start + first, first + config.window
             if not alignment.window_ok(start, config.window):
                 continue
-            window_crops = crops[first:stop]
+            window_crops = real_window_canvas(crops[first:stop], width, height, config.camera)
             # Include all real mosaics visible in this work area, including those
             # belonging to a neighboring track, in both fitting and compositing.
-            window_regions = [clipped.frames.get(i, track.regions[first + i - start])
+            window_regions = [all_regions(i, track.regions[first + i - start])
                               for i in range(start, start + config.window)]
             rejected = False
             for offset_in_window, crop in enumerate(window_crops):
@@ -216,7 +247,7 @@ def plan_real_windows(
             if not rejected:
                 plans.append(RealWindowPlan(
                     key=f"{safe_stem(title)}-t{number:03d}-f{start:06d}", track=number, start=start,
-                    boxes=track.boxes[first:stop], regions=window_regions, crops=window_crops,
+                    boxes=boxes[first:stop], regions=window_regions, crops=window_crops,
                     work=_work_area(window_crops, info),
                     leak_indices=tuple(int(i) for i in alignment.leak_indices(start, start + config.window)),
                     previous_leak_index=(alignment.leak_index(start - 1)
@@ -283,6 +314,27 @@ def _mask_to_canvas(mask: np.ndarray, crop: CropFrame) -> np.ndarray:
     return crop_to_canvas(image, crop)[..., 0].copy()
 
 
+def _redetect(retail: np.ndarray, matched: np.ndarray, block: float, excluded: np.ndarray,
+              config: RealPairConfig) -> np.ndarray:
+    """Flat retail pixels differing from the fitted leak, cleaned at block scale."""
+    r = cv2.cvtColor(retail.astype(np.float32), cv2.COLOR_RGB2GRAY)
+    d = cv2.cvtColor(matched.astype(np.float32), cv2.COLOR_RGB2GRAY)
+    size = max(3, round(block / 2))
+    mean = cv2.boxFilter(r, -1, (size, size))
+    variance = cv2.boxFilter(r * r, -1, (size, size)) - mean * mean
+    std = np.sqrt(np.maximum(variance, 0))
+    difference = np.abs(r - d)
+    difference[excluded] = 0  # excluded overlays/borders cannot seed neighboring evidence
+    difference = cv2.boxFilter(difference, -1, (size, size))
+    evidence = (difference > config.redetect_min_diff) & (std < config.redetect_max_std) & ~excluded
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(evidence.astype(np.uint8), connectivity=8)
+    keep = stats[:, cv2.CC_STAT_AREA] >= max(1, math.ceil(block * block))
+    keep[0] = False
+    if count == 1 or not keep.any():
+        return np.zeros(evidence.shape, bool)
+    return grow(keep[labels], max(1, round(block))) & ~excluded
+
+
 class _WindowBuffer:
     """Active canvas buffers; future leak shots use a lossless canvas spool."""
 
@@ -294,6 +346,8 @@ class _WindowBuffer:
         self.leak: list[np.ndarray | None] = [None] * count
         self.previous: list[np.ndarray | None] = [None] * count
         self.alpha: list[np.ndarray | None] = [None] * count
+        self.region_masks: dict[int, np.ndarray] = {}
+        self.exclusions: dict[int, np.ndarray] = {}
         self.ring_pixels: dict[int, np.ndarray] = {}
         self.sample_masks: dict[int, np.ndarray] = {}
         self.sample_indices = tuple(np.linspace(0, count - 1, min(config.colour_sample_frames, count), dtype=int))
@@ -334,24 +388,30 @@ class _WindowBuffer:
                                   config, feather=config.target == "composite")
             if config.target == "composite":
                 self.alpha[index] = _mask_to_canvas(alpha, crop).clip(0, 1)
+                if config.redetect:
+                    self.region_masks[index] = _mask_to_canvas(grown, crop) > 1e-6
+            overlays = np.zeros(grown.shape, bool)
             for overlay in regions.overlays:
                 if overlay.active(self.plan.start + index):
                     area = _overlay_slice(overlay.box, self.plan.work,
                                           config.overlay_margin * max(alignment.retail_size))
                     if area is not None:
                         grown[area] = True
+                        overlays[area] = True
             excluded = _mask_to_canvas(grown, crop) > 1e-6
             if sampled:
                 self.sample_masks[index] = excluded
             if config.target == "composite":
+                if config.redetect:
+                    self.exclusions[index] = _mask_to_canvas(overlays, crop) > 1e-6
+                    _exclude_border(self.exclusions[index])
                 ring = _ring_mask(self.plan.regions[index], self.plan.work,
                                   max(alignment.retail_size), config)
                 ring = _mask_to_canvas(ring & ~grown, crop) > 1e-6
                 excluded = excluded.copy()
                 _exclude_border(excluded)
                 pixels = np.flatnonzero(ring & ~excluded)
-                if len(pixels) >= config.min_ring_pixels:
-                    self.ring_pixels[index] = pixels
+                self.ring_pixels[index] = pixels
 
     def _samples(self, *, border: bool = False) -> tuple[dict[int, np.ndarray], np.ndarray]:
         samples, ys = {}, []
@@ -422,21 +482,54 @@ class _WindowBuffer:
         np.clip(image, 0, 255, out=image)
         return image
 
-    def ring_score(self, quality: dict, fit: dict) -> dict:
+    def ring_score(self, quality: dict, fit: dict, alignment: Alignment,
+                   config: RealPairConfig) -> tuple[dict, dict]:
         residuals = []
+        shares = []
         gain, offset = np.asarray(fit["a"], np.float32), np.asarray(fit["b"], np.float32)
-        for index, pixels in self.ring_pixels.items():
-            matched = self._matched(index, quality, gain, offset).reshape(-1, 3)[pixels]
-            retail = self.retail[index].reshape(-1, 3)[pixels]
-            residuals.append(float(np.abs(retail - matched).mean()))
+        blocks = [_block(r, max(alignment.retail_size)) for items in self.plan.regions for r in items]
+        source_block = float(np.median(blocks)) if blocks else 0.015 * max(alignment.retail_size)
+        indices = range(len(self.plan.crops)) if config.target == "composite" else ()
+        for index in indices:
+            image = self._matched(index, quality, gain, offset)
+            pixels = self.ring_pixels.get(index, np.empty(0, dtype=int))
+            share = 0.0
+            if config.redetect:
+                crop = self.plan.crops[index]
+                block = source_block * crop.canvas / max(crop.size)
+                region_mask, excluded = self.region_masks[index], self.exclusions[index]
+                detected = _redetect(self.retail[index], image, block, excluded, config)
+                added = detected & ~region_mask
+                share = float(added.mean())
+                if added.any():
+                    final_mask = region_mask | detected
+                    soft = final_mask.astype(np.float32)
+                    sigma = config.feather_blocks * block
+                    if sigma > 0:
+                        soft = cv2.GaussianBlur(soft, (0, 0), sigmaX=sigma)
+                    soft[excluded] = 0
+                    # Preserve individual region feather widths outside new areas.
+                    self.alpha[index] = np.maximum(self.alpha[index], soft).clip(0, 1)
+                    ring = np.zeros(region_mask.shape, bool)
+                    ring.flat[pixels] = True
+                    ring |= grow(added, round(config.ring_blocks * block))
+                    pixels = np.flatnonzero(ring & ~final_mask & ~excluded)
+            shares.append(share)
+            if len(pixels) >= config.min_ring_pixels:
+                retail = self.retail[index].reshape(-1, 3)[pixels]
+                matched = image.reshape(-1, 3)[pixels]
+                residuals.append(float(np.abs(retail - matched).mean()))
         return {"score": float(np.percentile(residuals, 90)) if residuals else None,
                 "median": float(np.median(residuals)) if residuals else None,
-                "max": max(residuals) if residuals else None, "frames": len(residuals)}
+                "max": max(residuals) if residuals else None, "frames": len(residuals)}, {
+                    "added_share_mean": float(np.mean(shares)) if shares else 0.0,
+                    "added_share_max": max(shares, default=0.0),
+                }
 
     def finish(self, title: str, alignment: Alignment, out_dir: Path, config: RealPairConfig) -> dict:
         plan = self.plan
         fit, quality = self.quality_fit(config)
-        ring = self.ring_score(quality, fit)
+        ring, redetect = self.ring_score(quality, fit, alignment, config)
         gain, offset = np.asarray(fit["a"], np.float32), np.asarray(fit["b"], np.float32)
 
         def canvases(target: bool):
@@ -465,14 +558,17 @@ class _WindowBuffer:
         self.alpha.clear()
         self.sample_masks.clear()
         self.ring_pixels.clear()
+        self.region_masks.clear()
+        self.exclusions.clear()
         return {
             "video": f"clean/{plan.key}.mp4", "reference_video": f"mosaic/{plan.key}.mp4",
             "caption": config.caption, "key": plan.key, "title": title,
             "retail": alignment.retail, "leak": alignment.leak, "track": plan.track,
             "start": plan.start, "leak_start": min(plan.leak_indices), "leak_stop": max(plan.leak_indices) + 1,
-            "frames": len(plan.crops), "work": list(plan.work), "crops": [list(c.box) for c in plan.crops],
+            "frames": len(plan.crops), "canvas": plan.crops[0].canvas,
+            "work": list(plan.work), "crops": [list(c.box) for c in plan.crops],
             "target": config.target, "colour_fit": fit, "leak_indices": list(plan.leak_indices),
-            "quality": quality, "ring": ring,
+            "quality": quality, "ring": ring, "redetect": redetect,
         }
 
 
@@ -597,7 +693,7 @@ def load_config(path: Path | None) -> RealPairConfig:
     unknown = set(data) - {"pairs", "camera"}
     if unknown:
         raise ValueError(f"{path}: unknown sections {sorted(unknown)}")
-    camera = replace(CameraConfig(), **(data.get("camera") or {}))
+    camera = replace(RealCameraConfig(), **(data.get("camera") or {}))
     return replace(RealPairConfig(), **(data.get("pairs") or {}), camera=camera)
 
 

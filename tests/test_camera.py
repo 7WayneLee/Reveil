@@ -59,3 +59,48 @@ def test_gaussian_smooth_keeps_constants_and_length():
     values = np.full(50, 7.0)
     np.testing.assert_allclose(gaussian_smooth(values, 3.0), values)
     assert len(gaussian_smooth(np.arange(10.0), 2.0)) == 10
+
+
+def test_real_views_fill_square_and_only_letterbox_when_frame_is_too_short():
+    from reveil.camera import RealCameraConfig, plan_tight_crops
+
+    config = RealCameraConfig()
+    small, = plan_tight_crops([(10, 10, 50, 50)], 1920, 1080, 24, config)
+    assert small.size == (512, 512)
+    assert small.resized == small.size  # no upscaling
+    assert small.box[:2] == (0, 0)
+    wide, = plan_tight_crops([(400, 300, 1300, 700)], 1920, 1080, 24, config)
+    assert wide.size == (1008, 1008)  # 900 + 2 * (0.06 * 900)
+    assert wide.pad == (0, 0, 0, 0)
+    huge, = plan_tight_crops([(100, 300, 1800, 800)], 1920, 1080, 24, config)
+    assert huge.size == (1902, 1080)
+    assert huge.pad[1] > 0 and huge.pad[3] > 0
+
+
+def test_real_smoothed_views_contain_the_border_and_limit_zoom():
+    from reveil.camera import RealCameraConfig, plan_tight_crops
+
+    config = RealCameraConfig()
+    boxes = [(10, 10, 50, 70)] * 60 + [(600, 250, 1300, 700)] * 60
+    crops = plan_tight_crops(boxes, 1920, 1080, 24, config)
+    for crop, box in zip(crops, boxes):
+        border = max(config.min_border, config.border_fraction * max(box[2] - box[0], box[3] - box[1]))
+        bordered = (max(0, box[0] - border), max(0, box[1] - border),
+                    min(1920, box[2] + border), min(1080, box[3] + border))
+        assert contains(crop, bordered)
+        assert crop.size[0] == crop.size[1]
+    sides = np.array([max(c.size) for c in crops], float)
+    assert (np.abs(np.diff(np.log(sides))) <=
+            math.log(config.max_zoom_per_second) / 24 + np.log1p(1 / sides[1:]) + 1e-9).all()
+
+
+def test_real_canvas_threshold_is_strict_and_applies_to_whole_window():
+    from reveil.camera import RealCameraConfig, real_window_canvas
+
+    config = RealCameraConfig()
+    for side, expected in ((512, 512), (640, 512), (641, 768), (1008, 768)):
+        crops = real_window_canvas([CropFrame((0, 0, 512, 512), 512),
+                                    CropFrame((0, 0, side, side), 512)], 1920, 1080, config)
+        assert {c.canvas for c in crops} == {expected}
+        assert all(max(c.size) >= expected for c in crops)
+        assert all(c.pad == (0, 0, 0, 0) for c in crops)

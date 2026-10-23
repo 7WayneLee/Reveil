@@ -5,6 +5,9 @@ sees the framing it was trained on. A small region gets extra context (up to ``c
 source pixels, at most ``max_context_ratio`` times its size); the view size holds its
 recent maximum, zooms at most ``max_zoom_per_second``, and is Gaussian-smoothed like the
 view centre. Each view is letterboxed into a square canvas with reflect padding.
+
+Real pairs use ``plan_tight_crops`` and ``RealCameraConfig``: a smaller border,
+square views wherever the frame permits, and one of two canvases per window.
 """
 
 from __future__ import annotations
@@ -28,6 +31,16 @@ class CameraConfig:
     smooth_seconds: float = 0.5  # Gaussian sigma of the view centre and size
     hold_seconds: float = 1.0  # the view size never drops below its max over this span
     max_zoom_per_second: float = 1.1
+
+
+@dataclass(frozen=True)
+class RealCameraConfig(CameraConfig):
+    """Tighter real-pair framing; the synthetic camera keeps its original rules."""
+
+    border_fraction: float = 0.06
+    min_border: float = 20
+    large_canvas: int = 768
+    large_min_side: float = 640
 
 
 @dataclass(frozen=True)
@@ -121,6 +134,60 @@ def plan_crops(
         y0 = _place(center_y[i], h, b[i, 1], b[i, 3], frame_h)
         crops.append(CropFrame((x0, y0, x0 + w, y0 + h), config.canvas))
     return crops
+
+
+def plan_tight_crops(
+    boxes: Sequence[Box], frame_w: int, frame_h: int, fps: float,
+    config: RealCameraConfig = RealCameraConfig(),
+) -> list[CropFrame]:
+    """Square real-pair views containing the clamped, bordered region each frame.
+
+    Raise the smoothed size where needed to retain the border, then reapply the
+    zoom limit in both directions. Only a frame dimension can prevent a square.
+    """
+    b = np.asarray(boxes, dtype=np.float64).reshape(-1, 4).copy()
+    if not len(b):
+        return []
+    border = np.maximum(config.min_border, config.border_fraction * np.maximum(
+        b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]))
+    b[:, :2] -= border[:, None]
+    b[:, 2:] += border[:, None]
+    b[:, (0, 2)] = b[:, (0, 2)].clip(0, frame_w)
+    b[:, (1, 3)] = b[:, (1, 3)].clip(0, frame_h)
+    b[:, :2] = np.floor(b[:, :2])
+    b[:, 2:] = np.ceil(b[:, 2:])
+    wanted = np.maximum(config.canvas, np.maximum(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]))
+    step = math.log(config.max_zoom_per_second) / fps
+    log_side = _running_max(np.log(wanted), max(1, round(config.hold_seconds * fps / 2)))
+    log_side = _rate_limit(log_side, step)
+    sigma = config.smooth_seconds * fps
+    log_side = _rate_limit(np.maximum(gaussian_smooth(log_side, sigma), np.log(wanted)), step)
+    sides = np.ceil(np.exp(log_side) - 1e-9).astype(int)
+    centers = [gaussian_smooth((b[:, axis] + b[:, axis + 2]) / 2, sigma) for axis in (0, 1)]
+    crops = []
+    for i, side in enumerate(sides):
+        w, h = min(int(side), frame_w), min(int(side), frame_h)
+        x = _place(centers[0][i], w, b[i, 0], b[i, 2], frame_w)
+        y = _place(centers[1][i], h, b[i, 1], b[i, 3], frame_h)
+        crops.append(CropFrame((x, y, x + w, y + h), config.canvas))
+    return crops
+
+
+def real_window_canvas(
+    crops: Sequence[CropFrame], frame_w: int, frame_h: int, config: RealCameraConfig,
+) -> list[CropFrame]:
+    """Choose one canvas per window and grow small views to avoid upscaling."""
+    canvas = (config.large_canvas if any(max(c.size) > config.large_min_side for c in crops)
+              else config.canvas)
+    result = []
+    for crop in crops:
+        side = max(canvas, *crop.size)
+        w, h = min(side, frame_w), min(side, frame_h)
+        x0, y0, x1, y1 = crop.box
+        x = _place((x0 + x1) / 2, w, x0, x1, frame_w)
+        y = _place((y0 + y1) / 2, h, y0, y1, frame_h)
+        result.append(CropFrame((x, y, x + w, y + h), canvas))
+    return result
 
 
 def crop_to_canvas(image: np.ndarray, crop: CropFrame) -> np.ndarray:
