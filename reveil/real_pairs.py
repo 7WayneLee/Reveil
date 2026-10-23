@@ -3,6 +3,8 @@
 Composite targets preserve the retail pixels outside the real mosaic. Source videos
 are decoded once in forward order; active windows retain canvas-sized arrays.
 Only leak canvases needed by a future window are spooled to temporary disk.
+Composite targets match leak blur and previous-frame mixing to the retail and gate
+blend seams. Leak targets use colour fitting only, without blur, mixing or a seam gate.
 """
 
 from __future__ import annotations
@@ -50,6 +52,14 @@ class RealPairConfig:
     feather_blocks: float = 0.25
     overlay_margin: float = 0.02
     colour_sample_frames: int = 8
+    match_quality: bool = True
+    quality_tolerance: float = 0.03
+    blur_sigmas: tuple[float, ...] = (0, 0.4, 0.7, 1.0, 1.4, 1.8, 2.4, 3.0)
+    prev_mixes: tuple[float, ...] = (0, 0.1, 0.2, 0.3, 0.4)
+    ring_blocks: float = 1.0
+    min_ring_pixels: int = 256
+    ring_max_residual: float | None = 6.0
+    candidate_factor: float = 1.5
     camera: CameraConfig = field(default_factory=CameraConfig)
 
     def __post_init__(self) -> None:
@@ -61,6 +71,19 @@ class RealPairConfig:
             raise ValueError("max_windows_per_title must be non-negative")
         if min(self.mask_grow_blocks, self.feather_blocks, self.overlay_margin) < 0:
             raise ValueError("mask growth, feathering and overlay margin must be non-negative")
+        if not self.blur_sigmas or any(not math.isfinite(s) or s < 0 for s in self.blur_sigmas):
+            raise ValueError("blur_sigmas must be non-empty, finite and non-negative")
+        if not self.prev_mixes or any(not math.isfinite(w) or not 0 <= w <= 1 for w in self.prev_mixes):
+            raise ValueError("prev_mixes must be non-empty, finite and within [0, 1]")
+        if not math.isfinite(self.quality_tolerance) or self.quality_tolerance < 0:
+            raise ValueError("quality_tolerance must be finite and non-negative")
+        if not math.isfinite(self.ring_blocks) or self.ring_blocks < 0 or self.min_ring_pixels < 1:
+            raise ValueError("ring_blocks must be non-negative and min_ring_pixels positive")
+        if self.ring_max_residual is not None and (not math.isfinite(self.ring_max_residual)
+                                                   or self.ring_max_residual < 0):
+            raise ValueError("ring_max_residual must be None or finite and non-negative")
+        if not math.isfinite(self.candidate_factor) or self.candidate_factor <= 0:
+            raise ValueError("candidate_factor must be finite and positive")
 
 
 @dataclass
@@ -73,6 +96,8 @@ class RealWindowPlan:
     crops: list[CropFrame]
     work: tuple[int, int, int, int]
     leak_indices: tuple[int, ...]
+    previous_leak_index: int | None = None
+    priority: float = 0.0
 
 
 def _block(region: Region, long_side: int) -> float:
@@ -118,6 +143,30 @@ def _overlay_slice(box: Box, work: tuple[int, int, int, int], margin: float) -> 
     if left >= right or top >= bottom:
         return None
     return slice(top - y0, bottom - y0), slice(left - x0, right - x0)
+
+
+def _ring_mask(regions: list[Region], work: tuple[int, int, int, int], long_side: int,
+               config: RealPairConfig) -> np.ndarray:
+    """Union of per-region rings, grown in work pixels with the mask's block sizes."""
+    x0, y0, x1, y1 = work
+    shape = (y1 - y0, x1 - x0)
+    outer = np.zeros(shape, bool)
+    for region in regions:
+        block = _block(region, long_side)
+        radius, ring_radius = round(config.mask_grow_blocks * block), round(config.ring_blocks * block)
+        if ring_radius == 0:
+            continue
+        halo = radius + ring_radius + 1
+        mask = rasterize([region], (x0 - halo, y0 - halo),
+                         (shape[0] + 2 * halo, shape[1] + 2 * halo), ellipse=False)
+        mask = grow(grow(mask, radius), ring_radius)
+        outer |= mask[halo:halo + shape[0], halo:halo + shape[1]]
+    return outer
+
+
+def _exclude_border(mask: np.ndarray) -> None:
+    mask[:4] = mask[-4:] = True
+    mask[:, :4] = mask[:, -4:] = True
 
 
 def plan_real_windows(
@@ -170,16 +219,28 @@ def plan_real_windows(
                     boxes=track.boxes[first:stop], regions=window_regions, crops=window_crops,
                     work=_work_area(window_crops, info),
                     leak_indices=tuple(int(i) for i in alignment.leak_indices(start, start + config.window)),
+                    previous_leak_index=(alignment.leak_index(start - 1)
+                                         if config.target == "composite" and config.match_quality else None),
                 ))
-    if config.max_windows_per_title is not None and len(plans) > config.max_windows_per_title:
-        keep = rng.choice(len(plans), config.max_windows_per_title, replace=False)
-        plans = [plans[i] for i in sorted(keep)]
+    if config.max_windows_per_title is not None:
+        cap = config.max_windows_per_title
+        candidates = max(cap + 1, math.ceil(config.candidate_factor * cap))
+        if len(plans) > candidates:
+            keep = rng.choice(len(plans), candidates, replace=False)
+            plans = [plans[i] for i in sorted(keep)]
+    for plan in plans:
+        plan.priority = float(rng.random())
     return sorted(plans, key=lambda plan: (plan.start, plan.track))
 
 
 def _fit_colour(leak: np.ndarray, retail: np.ndarray) -> dict:
     """Fit retail ~= a*leak+b independently per RGB channel, trimming twice."""
-    gains, offsets = [], []
+    return _fit_colour_scored(leak, retail)[0]
+
+
+def _fit_colour_scored(leak: np.ndarray, retail: np.ndarray) -> tuple[dict, float]:
+    """The same fit, also scoring only the samples retained in each channel."""
+    gains, offsets, residuals = [], [], []
     for channel in range(3):
         x, y = leak[:, channel].astype(np.float64), retail[:, channel].astype(np.float64)
         a, b = 1.0, 0.0
@@ -196,7 +257,25 @@ def _fit_colour(leak: np.ndarray, retail: np.ndarray) -> dict:
                 x, y = x[keep], y[keep]
         gains.append(a)
         offsets.append(b)
-    return {"a": gains, "b": offsets, "samples": len(leak)}
+        residuals.append(np.abs(y - (a * x + b)))
+    score = float(np.concatenate(residuals).mean())
+    return {"a": gains, "b": offsets, "samples": len(leak)}, score
+
+
+def _blur(image: np.ndarray, sigma: float) -> np.ndarray:
+    image = image.astype(np.float32)
+    return cv2.GaussianBlur(image, (0, 0), sigmaX=sigma) if sigma else image
+
+
+def _ring_rejected(ring: dict, config: RealPairConfig) -> bool:
+    return bool(config.target == "composite" and config.ring_max_residual
+                and ring["score"] is not None and ring["score"] > config.ring_max_residual)
+
+
+def _select_quality(scores: dict[tuple[float, float], float], tolerance: float) -> tuple[float, float]:
+    """Prefer less mixing, then less blur, within a fraction of the best score."""
+    limit = min(scores.values()) * (1 + tolerance)
+    return min((key for key, score in scores.items() if score <= limit), key=lambda key: (key[1], key[0]))
 
 
 def _mask_to_canvas(mask: np.ndarray, crop: CropFrame) -> np.ndarray:
@@ -213,17 +292,19 @@ class _WindowBuffer:
         count = len(plan.crops)
         self.retail: list[np.ndarray | None] = [None] * count
         self.leak: list[np.ndarray | None] = [None] * count
+        self.previous: list[np.ndarray | None] = [None] * count
         self.alpha: list[np.ndarray | None] = [None] * count
+        self.ring_pixels: dict[int, np.ndarray] = {}
         self.sample_masks: dict[int, np.ndarray] = {}
         self.sample_indices = tuple(np.linspace(0, count - 1, min(config.colour_sample_frames, count), dtype=int))
-        self.spooled: dict[int, Path] = {}
+        self.spooled: dict[tuple[str, int], Path] = {}
         self.retail_count = 0
         self.leak_count = 0
 
     def activate(self) -> None:
         self.active = True
-        for index, path in self.spooled.items():
-            self.leak[index] = np.load(path, allow_pickle=False)
+        for (side, index), path in self.spooled.items():
+            getattr(self, side)[index] = np.load(path, allow_pickle=False)
             path.unlink()
         self.spooled.clear()
 
@@ -235,14 +316,15 @@ class _WindowBuffer:
             raise RuntimeError(f"{self.plan.key}: {side} dimensions do not match the alignment")
         crop = self.plan.crops[index].shifted(x0, y0)
         canvas = crop_to_canvas(work, crop).copy()
-        if side == "leak":
+        if side in {"leak", "previous"}:
             if self.active:
-                self.leak[index] = canvas
+                getattr(self, side)[index] = canvas
             else:
-                path = self.temp_dir / f"{self.plan.key}-leak-{index:04d}.npy"
+                path = self.temp_dir / f"{self.plan.key}-{side}-{index:04d}.npy"
                 np.save(path, canvas, allow_pickle=False)
-                self.spooled[index] = path
-            self.leak_count += 1
+                self.spooled[side, index] = path
+            if side == "leak":
+                self.leak_count += 1
             return
         self.retail[index] = canvas
         self.retail_count += 1
@@ -252,42 +334,115 @@ class _WindowBuffer:
                                   config, feather=config.target == "composite")
             if config.target == "composite":
                 self.alpha[index] = _mask_to_canvas(alpha, crop).clip(0, 1)
+            for overlay in regions.overlays:
+                if overlay.active(self.plan.start + index):
+                    area = _overlay_slice(overlay.box, self.plan.work,
+                                          config.overlay_margin * max(alignment.retail_size))
+                    if area is not None:
+                        grown[area] = True
+            excluded = _mask_to_canvas(grown, crop) > 1e-6
             if sampled:
-                for overlay in regions.overlays:
-                    if overlay.active(self.plan.start + index):
-                        area = _overlay_slice(overlay.box, self.plan.work,
-                                              config.overlay_margin * max(alignment.retail_size))
-                        if area is not None:
-                            grown[area] = True
-                self.sample_masks[index] = _mask_to_canvas(grown, crop) > 1e-6
+                self.sample_masks[index] = excluded
+            if config.target == "composite":
+                ring = _ring_mask(self.plan.regions[index], self.plan.work,
+                                  max(alignment.retail_size), config)
+                ring = _mask_to_canvas(ring & ~grown, crop) > 1e-6
+                excluded = excluded.copy()
+                _exclude_border(excluded)
+                pixels = np.flatnonzero(ring & ~excluded)
+                if len(pixels) >= config.min_ring_pixels:
+                    self.ring_pixels[index] = pixels
 
-    def colour_fit(self) -> dict:
-        xs, ys = [], []
+    def _samples(self, *, border: bool = False) -> tuple[dict[int, np.ndarray], np.ndarray]:
+        samples, ys = {}, []
         for index in self.sample_indices:
-            pixels = np.flatnonzero(~self.sample_masks[index])
+            excluded = self.sample_masks[index].copy()
+            if border:
+                _exclude_border(excluded)
+            pixels = np.flatnonzero(~excluded)
             # Bound regression memory on large work areas; deterministic spatial
             # samples cover every selected frame, with at most 32K pixels each.
             if len(pixels) > 32768:
                 pixels = pixels[np.linspace(0, len(pixels) - 1, 32768, dtype=int)]
-            xs.append(self.leak[index].reshape(-1, 3)[pixels])
+            samples[index] = pixels
             ys.append(self.retail[index].reshape(-1, 3)[pixels])
-        x, y = np.concatenate(xs), np.concatenate(ys)
-        if len(x) < 2:
+        y = np.concatenate(ys)
+        if len(y) < 2:
             raise ValueError(f"{self.plan.key}: no uncensored, overlay-free pixels for colour fitting")
+        return samples, y
+
+    def colour_fit(self) -> dict:
+        samples, y = self._samples()
+        x = np.concatenate([self.leak[index].reshape(-1, 3)[pixels] for index, pixels in samples.items()])
         return _fit_colour(x, y)
+
+    def _previous(self, index: int) -> np.ndarray | None:
+        if index and self.plan.crops[index - 1] == self.plan.crops[index]:
+            return self.leak[index - 1]
+        return self.previous[index]
+
+    def quality_fit(self, config: RealPairConfig) -> tuple[dict, dict]:
+        enabled = config.target == "composite" and config.match_quality
+        samples, y = self._samples(border=enabled)
+        fits, scores = {}, {}
+        identity = None
+        sigmas = sorted(set(config.blur_sigmas) | {0}) if enabled else [0]
+        mixes = sorted(set(config.prev_mixes) | {0}) if enabled else [0]
+        for sigma in sigmas:
+            current, previous = [], []
+            for index, pixels in samples.items():
+                image = _blur(self.leak[index], sigma)
+                current.append(image.reshape(-1, 3)[pixels])
+                prior = self._previous(index) if enabled else None
+                image = _blur(prior, sigma) if prior is not None else image
+                previous.append(image.reshape(-1, 3)[pixels])
+            x, p = np.concatenate(current), np.concatenate(previous)
+            for mix in mixes:
+                candidate = (1 - mix) * x + mix * p if mix else x
+                fit, score = _fit_colour_scored(candidate, y)
+                if sigma == 0 and mix == 0:
+                    identity = score
+                if enabled and (sigma not in config.blur_sigmas or mix not in config.prev_mixes):
+                    continue
+                key = float(sigma), float(mix)
+                fits[key], scores[key] = fit, score
+        sigma, mix = _select_quality(scores, config.quality_tolerance)
+        return fits[sigma, mix], {"sigma": sigma, "prev_mix": mix,
+                                 "residual": scores[sigma, mix], "identity_residual": identity}
+
+    def _matched(self, index: int, quality: dict, gain: np.ndarray, offset: np.ndarray) -> np.ndarray:
+        image = _blur(self.leak[index], quality["sigma"])
+        previous = self._previous(index)
+        mix = quality["prev_mix"]
+        if mix and previous is not None:
+            image *= 1 - mix
+            image += mix * _blur(previous, quality["sigma"])
+        image *= gain
+        image += offset
+        np.clip(image, 0, 255, out=image)
+        return image
+
+    def ring_score(self, quality: dict, fit: dict) -> dict:
+        residuals = []
+        gain, offset = np.asarray(fit["a"], np.float32), np.asarray(fit["b"], np.float32)
+        for index, pixels in self.ring_pixels.items():
+            matched = self._matched(index, quality, gain, offset).reshape(-1, 3)[pixels]
+            retail = self.retail[index].reshape(-1, 3)[pixels]
+            residuals.append(float(np.abs(retail - matched).mean()))
+        return {"score": float(np.percentile(residuals, 90)) if residuals else None,
+                "median": float(np.median(residuals)) if residuals else None,
+                "max": max(residuals) if residuals else None, "frames": len(residuals)}
 
     def finish(self, title: str, alignment: Alignment, out_dir: Path, config: RealPairConfig) -> dict:
         plan = self.plan
-        fit = self.colour_fit()
+        fit, quality = self.quality_fit(config)
+        ring = self.ring_score(quality, fit)
         gain, offset = np.asarray(fit["a"], np.float32), np.asarray(fit["b"], np.float32)
 
         def canvases(target: bool):
             for index in range(len(plan.crops)):
                 if target:
-                    image = self.leak[index].astype(np.float32)
-                    image *= gain
-                    image += offset
-                    np.clip(image, 0, 255, out=image)
+                    image = self._matched(index, quality, gain, offset)
                     if config.target == "composite":
                         alpha = self.alpha[index]
                         retail = self.retail[index]
@@ -297,12 +452,19 @@ class _WindowBuffer:
                     image = self.retail[index]
                 yield image
 
-        write_video(out_dir / "clean" / f"{plan.key}.mp4", canvases(True), config.fps, crf=config.output_crf)
-        write_video(out_dir / "mosaic" / f"{plan.key}.mp4", canvases(False), config.fps, crf=config.output_crf)
+        rejected = _ring_rejected(ring, config)
+        for sub, target in (("clean", True), ("mosaic", False)):
+            path = out_dir / sub / f"{plan.key}.mp4"
+            if rejected:
+                path.unlink(missing_ok=True)
+            else:
+                write_video(path, canvases(target), config.fps, crf=config.output_crf)
         self.retail.clear()
         self.leak.clear()
+        self.previous.clear()
         self.alpha.clear()
         self.sample_masks.clear()
+        self.ring_pixels.clear()
         return {
             "video": f"clean/{plan.key}.mp4", "reference_video": f"mosaic/{plan.key}.mp4",
             "caption": config.caption, "key": plan.key, "title": title,
@@ -310,6 +472,7 @@ class _WindowBuffer:
             "start": plan.start, "leak_start": min(plan.leak_indices), "leak_stop": max(plan.leak_indices) + 1,
             "frames": len(plan.crops), "work": list(plan.work), "crops": [list(c.box) for c in plan.crops],
             "target": config.target, "colour_fit": fit, "leak_indices": list(plan.leak_indices),
+            "quality": quality, "ring": ring,
         }
 
 
@@ -318,7 +481,13 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
     demands = defaultdict(list)
     for plan in plans:
         for index, leak_index in enumerate(plan.leak_indices):
-            demands[leak_index].append((plan, index))
+            demands[leak_index].append((plan, "leak", index))
+        if config.target == "composite" and config.match_quality:
+            if plan.previous_leak_index is not None:
+                demands[plan.previous_leak_index].append((plan, "previous", 0))
+            for index in range(1, len(plan.crops)):
+                if plan.crops[index - 1] != plan.crops[index]:
+                    demands[plan.leak_indices[index - 1]].append((plan, "previous", index))
     buffers: dict[str, _WindowBuffer] = {}
 
     def buffer(plan: RealWindowPlan) -> _WindowBuffer:
@@ -340,6 +509,9 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
                 plan = next(upcoming, None)
             if active:
                 required = max(r.plan.leak_indices[frame_index - r.plan.start] for r in active)
+                required = max([required] + [r.plan.previous_leak_index for r in active
+                                            if frame_index == r.plan.start
+                                            and r.plan.previous_leak_index is not None])
                 while leak_position < required:
                     try:
                         leak = next(leak_frames)
@@ -350,8 +522,8 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
                     if needed:
                         if (leak.shape[1], leak.shape[0]) != alignment.retail_size:
                             leak = cv2.resize(leak, alignment.retail_size, interpolation=cv2.INTER_AREA)
-                        for needed_plan, index in needed:
-                            buffer(needed_plan).add("leak", index, leak, alignment, regions, config)
+                        for needed_plan, side, index in needed:
+                            buffer(needed_plan).add(side, index, leak, alignment, regions, config)
                 for render in active:
                     render.add("retail", frame_index - render.plan.start, retail, alignment, regions, config)
                 for render in list(active):
@@ -366,6 +538,21 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
     if len(rows) != len(plans):
         raise RuntimeError(f"{title}: retail ended early ({len(rows)} of {len(plans)} windows)")
     return sorted(rows, key=lambda row: (row["start"], row["track"]))
+
+
+def _title_stats(rows: list[dict], kept: int, config: RealPairConfig) -> dict:
+    rejected = sum(_ring_rejected(row["ring"], config) for row in rows)
+    histograms = {}
+    for name in ("sigma", "prev_mix"):
+        counts = defaultdict(int)
+        for row in rows:
+            counts[str(row["quality"][name])] += 1
+        histograms[f"{name}_histogram"] = dict(sorted(counts.items(), key=lambda item: float(item[0])))
+    scores = [row["ring"]["score"] for row in rows if row["ring"]["score"] is not None]
+    return {"candidates": len(rows), "rejected_ring": rejected, "accepted": len(rows) - rejected,
+            "kept": kept, "dropped_extra": len(rows) - rejected - kept, **histograms,
+            "ring_percentiles": {f"p{p}": float(np.percentile(scores, p)) if scores else None
+                                 for p in (10, 50, 90)}}
 
 
 def build_title_pairs(
@@ -387,9 +574,19 @@ def build_title_pairs(
     if plans:
         with tempfile.TemporaryDirectory(prefix="reveil-real-") as temp_dir:
             rows = _render(title, alignment, regions, plans, out_dir, Path(temp_dir), config, decode_threads)
-    meta = {"title": title, "retail": alignment.retail, "leak": alignment.leak, "windows": rows}
+    accepted = [row for row in rows if not _ring_rejected(row["ring"], config)]
+    priorities = {plan.key: plan.priority for plan in plans}
+    if config.max_windows_per_title is not None:
+        ranked = sorted(accepted, key=lambda row: (priorities[row["key"]], row["key"]))
+        accepted = ranked[:config.max_windows_per_title]
+        for row in ranked[config.max_windows_per_title:]:
+            for name in ("video", "reference_video"):
+                (out_dir / row[name]).unlink(missing_ok=True)
+    accepted.sort(key=lambda row: (row["start"], row["track"]))
+    meta = {"title": title, "retail": alignment.retail, "leak": alignment.leak, "windows": accepted,
+            "stats": _title_stats(rows, len(accepted), config)}
     _write_atomic(meta_path, json.dumps(meta))
-    return rows
+    return accepted
 
 
 def load_config(path: Path | None) -> RealPairConfig:
@@ -410,6 +607,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, help="YAML overrides: pairs / camera sections")
     parser.add_argument("--target", choices=("composite", "leak"))
     parser.add_argument("--max-windows-per-title", type=int)
+    parser.add_argument("--no-match-quality", action="store_true", help="disable composite blur and temporal matching")
+    parser.add_argument("--ring-max-residual", type=float, help="maximum seam-ring residual in grey levels; 0 disables (default: 6)")
+    parser.add_argument("--candidate-factor", type=float, help="candidate windows per capped output window (default: 1.5)")
     parser.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)))
     parser.add_argument("--decode-threads", type=int, default=2, help="threads per video decoder (default: 2)")
     parser.add_argument("--seed", type=int, default=0)
@@ -417,8 +617,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", nargs="+", help="title stems to include")
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    overrides = {name: getattr(args, name) for name in ("target", "max_windows_per_title")
+    overrides = {name: getattr(args, name) for name in ("target", "max_windows_per_title", "ring_max_residual", "candidate_factor")
                  if getattr(args, name) is not None}
+    if args.no_match_quality:
+        overrides["match_quality"] = False
     config = replace(config, **overrides)
     if args.workers < 1:
         parser.error("--workers must be positive")
@@ -453,7 +655,14 @@ def main(argv: list[str] | None = None) -> int:
         for done, future in enumerate(as_completed(futures), 1):
             title = futures[future]
             try:
-                print(f"[{done}/{len(jobs)}] {title}: {len(future.result())} pairs", flush=True)
+                rows = future.result()
+                meta = json.loads((args.out / "meta" / f"{safe_stem(title)}.json").read_text(encoding="utf-8"))
+                stats = meta.get("stats")
+                summary = (f"; candidates={stats['candidates']}, ring-rejected={stats['rejected_ring']}, "
+                           f"accepted={stats['accepted']}, extra={stats['dropped_extra']}, "
+                           f"sigma={stats['sigma_histogram']}, prev_mix={stats['prev_mix_histogram']}, "
+                           f"ring={stats['ring_percentiles']}" if stats else "")
+                print(f"[{done}/{len(jobs)}] {title}: {len(rows)} pairs{summary}", flush=True)
             except Exception as error:  # noqa: BLE001 - finish independent titles
                 failed += 1
                 print(f"[{done}/{len(jobs)}] {title}: FAILED: {error!r}", file=sys.stderr, flush=True)
