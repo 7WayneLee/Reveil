@@ -14,7 +14,18 @@ from reveil.mosaic import MosaicStyle, censor
 from reveil.pairs import _seed_for, rebuild_dataset, safe_stem
 from reveil.real_pairs import RealPairConfig, _fit_colour, _masks, load_config, main, plan_real_windows, build_title_pairs
 from reveil.regions import Overlay, Region, RegionSet, rasterize, save_regions
-from reveil.video import probe, read_frames, write_video
+from reveil.video import decoded_frames, probe, read_frames, write_video
+
+
+class _RGBFrame:
+    """Expose an already converted synthetic frame through the decoder interface."""
+
+    def __init__(self, image):
+        self.image = image
+
+    def to_ndarray(self, *, format):
+        assert format == "rgb24"
+        return self.image
 
 
 @pytest.fixture(scope="module")
@@ -80,6 +91,73 @@ def _plans(data, config=None, seed=0):
 def _build(data, out, config=None, **kwargs):
     return build_title_pairs("TITLE", data["alignment_path"], data["regions_path"], out,
                              config or data["config"], **kwargs)
+
+
+@pytest.mark.parametrize("target,match_quality", [("composite", False), ("composite", True), ("leak", True)])
+def test_selective_conversion_is_byte_identical_to_eager_read_frames(real_pair, tmp_path, monkeypatch,
+                                                                    target, match_quality):
+    import reveil.real_pairs as module
+
+    config = replace(real_pair["config"], target=target, match_quality=match_quality,
+                     max_windows_per_title=2, ring_max_residual=0)
+
+    def eager_frames(path, *, threads=None):
+        # The legacy route converts every frame in read_frames, even when unused.
+        # The wrapper returns that RGB array without converting it a second time.
+        for image in read_frames(path, threads=threads):
+            yield _RGBFrame(image)
+
+    with monkeypatch.context() as eager:
+        eager.setattr(module, "decoded_frames", eager_frames)
+        expected_rows = _build(real_pair, tmp_path / "eager", config)
+    actual_rows = _build(real_pair, tmp_path / "selective", config)
+    assert len(actual_rows) == len(expected_rows) == 2
+    assert actual_rows == expected_rows
+    for sub in ("clean", "mosaic", "meta"):
+        expected = {path.name: path.read_bytes() for path in (tmp_path / "eager" / sub).iterdir()}
+        actual = {path.name: path.read_bytes() for path in (tmp_path / "selective" / sub).iterdir()}
+        assert actual == expected
+
+
+@pytest.mark.parametrize("match_quality", [False, True])
+def test_render_converts_exactly_the_demanded_frames(real_pair, tmp_path, monkeypatch, match_quality):
+    import reveil.real_pairs as module
+
+    data = real_pair
+    config = replace(data["config"], window=17, hop=8, match_quality=match_quality,
+                     max_windows_per_title=2, candidate_factor=2, ring_max_residual=0)
+    plans = _plans(data, config)
+    retail_used = {index for plan in plans for index in range(plan.start, plan.start + len(plan.crops))}
+    leak_used = {index for plan in plans for index in plan.leak_indices}
+    if match_quality:
+        leak_used.update(plan.previous_leak_index for plan in plans if plan.previous_leak_index is not None)
+    expected = {data["alignment"].retail: sorted(retail_used), data["alignment"].leak: sorted(leak_used)}
+    decoded = {path: [] for path in expected}
+    converted = {path: [] for path in expected}
+    calls = []
+
+    class CountedFrame:
+        def __init__(self, frame, path, index):
+            self.frame, self.path, self.index = frame, path, index
+
+        def to_ndarray(self, *, format):
+            assert format == "rgb24"
+            converted[self.path].append(self.index)
+            return self.frame.to_ndarray(format=format)
+
+    def counted_frames(path, *, threads=None):
+        calls.append((path, threads))
+        for index, frame in enumerate(decoded_frames(path, threads=threads)):
+            decoded[path].append(index)
+            yield CountedFrame(frame, path, index)
+
+    monkeypatch.setattr(module, "decoded_frames", counted_frames)
+    assert len(_build(data, tmp_path / "out", config, decode_threads=3)) == 2
+    assert converted == expected
+    assert calls == [(data["alignment"].retail, 3), (data["alignment"].leak, 3)]
+    for path, indices in expected.items():
+        assert decoded[path] == list(range(max(indices) + 1))
+        assert len(converted[path]) < len(decoded[path])
 
 
 def test_composite_layout_reference_colours_and_resume(real_pair):
@@ -256,12 +334,12 @@ def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, 
     def fake_decode(path, *, threads=None):
         calls.append((path, threads))
         if path == alignment.retail:
-            yield from data["retail"]
+            yield from map(_RGBFrame, data["retail"])
         else:
             for frame in data["leak"]:
-                yield cv2.resize(frame, (640, 360), interpolation=cv2.INTER_NEAREST)
+                yield _RGBFrame(cv2.resize(frame, (640, 360), interpolation=cv2.INTER_NEAREST))
 
-    monkeypatch.setattr(module, "read_frames", fake_decode)
+    monkeypatch.setattr(module, "decoded_frames", fake_decode)
     config = replace(data["config"], target="leak", max_windows_per_title=2, colour_sample_frames=2)
     out = tmp_path / "out"
     rows = build_title_pairs("TITLE", alignment_path, regions_path, out, config, decode_threads=3)
@@ -326,14 +404,14 @@ def _quality_pair(tmp_path, monkeypatch, *, count=10, indices=None, start=1,
 
     def decode(path, *, threads=None):
         calls.append(path)
-        yield from retail if path == alignment.retail else leak
+        yield from map(_RGBFrame, retail if path == alignment.retail else leak)
 
     def encode(path, images, fps, *, crf):
         array = np.stack(list(images))
         written[path] = array
         path.write_bytes(array.tobytes())
 
-    monkeypatch.setattr(module, "read_frames", decode)
+    monkeypatch.setattr(module, "decoded_frames", decode)
     monkeypatch.setattr(module, "write_video", encode)
     config = RealPairConfig(window=count - start, hop=count - start, colour_sample_frames=5,
                             camera=CameraConfig(canvas=size, context=size))

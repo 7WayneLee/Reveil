@@ -36,7 +36,7 @@ from reveil.mosaic import grow
 from reveil.pairs import DEFAULT_CAPTION, _clipped, _seed_for, _work_area, _write_atomic, rebuild_dataset, safe_stem
 from reveil.regions import Box, Region, RegionSet, clip_box, load_regions, rasterize
 from reveil.tracks import build_tracks, window_starts
-from reveil.video import VideoInfo, read_frames, write_video
+from reveil.video import VideoInfo, decoded_frames, write_video
 
 
 @dataclass(frozen=True)
@@ -500,7 +500,7 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
     plan = next(upcoming, None)
     leak_position = -1
     last_frame = max(p.start + len(p.crops) for p in plans) - 1
-    with closing(read_frames(alignment.retail, threads=decode_threads)) as retail_frames, closing(read_frames(alignment.leak, threads=decode_threads)) as leak_frames:
+    with closing(decoded_frames(alignment.retail, threads=decode_threads)) as retail_frames, closing(decoded_frames(alignment.leak, threads=decode_threads)) as leak_frames:
         for frame_index, retail in enumerate(retail_frames):
             while plan is not None and plan.start == frame_index:
                 render = buffer(plan)
@@ -508,6 +508,7 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
                 active.append(render)
                 plan = next(upcoming, None)
             if active:
+                retail = retail.to_ndarray(format="rgb24")
                 required = max(r.plan.leak_indices[frame_index - r.plan.start] for r in active)
                 required = max([required] + [r.plan.previous_leak_index for r in active
                                             if frame_index == r.plan.start
@@ -520,6 +521,7 @@ def _render(title: str, alignment: Alignment, regions: RegionSet, plans: list[Re
                     leak_position += 1
                     needed = demands.pop(leak_position, [])
                     if needed:
+                        leak = leak.to_ndarray(format="rgb24")
                         if (leak.shape[1], leak.shape[0]) != alignment.retail_size:
                             leak = cv2.resize(leak, alignment.retail_size, interpolation=cv2.INTER_AREA)
                         for needed_plan, side, index in needed:

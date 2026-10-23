@@ -30,17 +30,22 @@ def probe(path: str | Path) -> VideoInfo:
         return VideoInfo(stream.codec_context.width, stream.codec_context.height, float(rate), frames)
 
 
-def read_frames(path: str | Path, size: tuple[int, int] | None = None,
-                threads: int | None = None) -> Iterator[np.ndarray]:
-    """Decoded RGB frames; ``size`` scales during conversion, ``threads`` caps the decoder."""
-    scaled = {} if size is None else {"width": size[0], "height": size[1], "interpolation": "AREA"}
+def decoded_frames(path: str | Path, threads: int | None = None) -> Iterator[av.VideoFrame]:
+    """Decoded frames without RGB conversion; ``threads`` caps the decoder."""
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         if threads is not None:
             stream.codec_context.thread_count = threads
-        for frame in container.decode(stream):
-            yield frame.to_ndarray(format="rgb24", **scaled)
+        yield from container.decode(stream)
+
+
+def read_frames(path: str | Path, size: tuple[int, int] | None = None,
+                threads: int | None = None) -> Iterator[np.ndarray]:
+    """Decoded RGB frames; ``size`` scales during conversion, ``threads`` caps the decoder."""
+    scaled = {} if size is None else {"width": size[0], "height": size[1], "interpolation": "AREA"}
+    for frame in decoded_frames(path, threads=threads):
+        yield frame.to_ndarray(format="rgb24", **scaled)
 
 
 class VideoWriter:
