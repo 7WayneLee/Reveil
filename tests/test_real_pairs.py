@@ -208,6 +208,38 @@ def test_cli_spawn_config_and_only_filter(real_pair, tmp_path, capsys):
         load_config(config_path)
 
 
+def test_cli_resumes_prepared_pairs_with_missing_source_videos(tmp_path, capsys):
+    title = "TITLE (prepared)"
+    align_dir, regions_dir, out = tmp_path / "align", tmp_path / "regions", tmp_path / "data"
+    align_dir.mkdir()
+    regions_dir.mkdir()
+    alignment = Alignment(str(tmp_path / "missing-retail.mp4"), str(tmp_path / "missing-leak.mp4"),
+                          1, 1, 24, 24, (64, 64), (64, 64), ((0, 0, 1),))
+    save_alignment(alignment, align_dir / f"{title}.json")
+    save_regions(RegionSet({}), regions_dir / f"{title}.json")
+    for sub in ("clean", "mosaic", "meta"):
+        (out / sub).mkdir(parents=True)
+    rows = [{"video": f"clean/{key}.mp4", "reference_video": f"mosaic/{key}.mp4"}
+            for key in ("kept", "missing-clean", "missing-mosaic")]
+    for clip in ("clean/kept.mp4", "mosaic/kept.mp4", "mosaic/missing-clean.mp4", "clean/missing-mosaic.mp4"):
+        (out / clip).write_bytes(b"prepared clip")
+    meta_path = out / "meta" / f"{safe_stem(title)}.json"
+    meta_path.write_text(json.dumps({"title": title, "windows": rows}))
+    (out / "dataset.jsonl").write_text("stale dataset\n")
+    args = ["--align-dir", str(align_dir), "--regions-dir", str(regions_dir),
+            "--out", str(out), "--workers", "1"]
+
+    assert main(args) == 0
+    assert f"[1/1] {title}: 3 pairs" in capsys.readouterr().out
+    assert [json.loads(line) for line in (out / "dataset.jsonl").read_text().splitlines()] == [
+        {**rows[0], "caption": RealPairConfig().caption}]
+    with pytest.raises(FileNotFoundError):
+        main([*args, "--overwrite"])
+    meta_path.unlink()
+    with pytest.raises(FileNotFoundError):
+        main(args)
+
+
 def test_resize_backward_mapping_and_single_forward_decode(real_pair, tmp_path, monkeypatch):
     # Exercise scale and reordered leak shots without another encode/decode cycle.
     # All frame arrays come from the generated fixture, never real footage.

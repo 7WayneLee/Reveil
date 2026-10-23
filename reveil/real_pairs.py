@@ -640,7 +640,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"skip {title}: no {regions_path}", file=sys.stderr)
             continue
         alignment = load_alignment(alignment_path)
-        size = Path(alignment.retail).stat().st_size + Path(alignment.leak).stat().st_size
+        if (args.out / "meta" / f"{stem}.json").exists() and not args.overwrite:
+            size = 0
+        else:
+            size = Path(alignment.retail).stat().st_size + Path(alignment.leak).stat().st_size
         jobs.append((size, title, alignment_path, regions_path))
     if not jobs:
         parser.error("no titles with alignment and region files")
